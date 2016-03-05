@@ -15,9 +15,8 @@
 
 use middle::def_id::DefId;
 use middle::subst::{ErasedRegions, NonerasedRegions, ParamSpace, Substs};
-use middle::ty::{self, HasTypeFlags, Ty};
+use middle::ty::{self, Ty, TyCtxt, TypeFoldable};
 use middle::ty::error::{ExpectedFound, TypeError};
-use middle::ty::fold::TypeFoldable;
 use std::rc::Rc;
 use syntax::abi;
 use rustc_front::hir as ast;
@@ -30,7 +29,7 @@ pub enum Cause {
 }
 
 pub trait TypeRelation<'a,'tcx> : Sized {
-    fn tcx(&self) -> &'a ty::ctxt<'tcx>;
+    fn tcx(&self) -> &'a TyCtxt<'tcx>;
 
     /// Returns a static string we can use for printouts.
     fn tag(&self) -> &'static str;
@@ -80,7 +79,7 @@ pub trait TypeRelation<'a,'tcx> : Sized {
         where T: Relate<'a,'tcx>;
 }
 
-pub trait Relate<'a,'tcx>: TypeFoldable<'tcx> + HasTypeFlags {
+pub trait Relate<'a,'tcx>: TypeFoldable<'tcx> {
     fn relate<R:TypeRelation<'a,'tcx>>(relation: &mut R,
                                        a: &Self,
                                        b: &Self)
@@ -106,8 +105,8 @@ impl<'a,'tcx:'a> Relate<'a,'tcx> for ty::TypeAndMut<'tcx> {
         } else {
             let mutbl = a.mutbl;
             let variance = match mutbl {
-                ast::MutImmutable => ty::Covariant,
-                ast::MutMutable => ty::Invariant,
+                ast::Mutability::MutImmutable => ty::Covariant,
+                ast::Mutability::MutMutable => ty::Invariant,
             };
             let ty = try!(relation.relate_with_variance(variance, &a.ty, &b.ty));
             Ok(ty::TypeAndMut {ty: ty, mutbl: mutbl})

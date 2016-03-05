@@ -15,7 +15,7 @@ use super::span_utils::SpanUtils;
 
 use middle::cstore::LOCAL_CRATE;
 use middle::def_id::{CRATE_DEF_INDEX, DefId};
-use middle::ty;
+use middle::ty::TyCtxt;
 
 use std::io::Write;
 
@@ -55,7 +55,7 @@ impl Recorder {
 pub struct FmtStrs<'a, 'tcx: 'a> {
     pub recorder: Box<Recorder>,
     span: SpanUtils<'a>,
-    tcx: &'a ty::ctxt<'tcx>,
+    tcx: &'a TyCtxt<'tcx>,
 }
 
 macro_rules! s { ($e:expr) => { format!("{}", $e) }}
@@ -96,12 +96,14 @@ pub enum Row {
     VarRef,
     TypeRef,
     FnRef,
+    Macro,
+    MacroUse,
 }
 
 impl<'a, 'tcx: 'a> FmtStrs<'a, 'tcx> {
     pub fn new(rec: Box<Recorder>,
                span: SpanUtils<'a>,
-               tcx: &'a ty::ctxt<'tcx>)
+               tcx: &'a TyCtxt<'tcx>)
                -> FmtStrs<'a, 'tcx> {
         FmtStrs {
             recorder: rec,
@@ -219,6 +221,14 @@ impl<'a, 'tcx: 'a> FmtStrs<'a, 'tcx> {
                       vec!("refid", "refidcrate", "qualname", "scopeid"),
                       true,
                       true),
+            Macro => ("macro",
+                         vec!("name", "qualname"),
+                         true,
+                         true),
+            MacroUse => ("macro_use",
+                         vec!("callee_name", "qualname", "scopeid"),
+                         true,
+                         true),
         }
     }
 
@@ -318,6 +328,7 @@ impl<'a, 'tcx: 'a> FmtStrs<'a, 'tcx> {
                             span: Span,
                             sub_span: Option<Span>,
                             values: Vec<String>) {
+        filter!(self.span, sub_span, span);
         match sub_span {
             Some(sub_span) => self.record_with_span(kind, span, sub_span, values),
             None => {
@@ -433,14 +444,13 @@ impl<'a, 'tcx: 'a> FmtStrs<'a, 'tcx> {
                               span: Span,
                               sub_span: Option<Span>,
                               id: NodeId,
-                              ctor_id: NodeId,
                               name: &str,
                               typ: &str,
                               val: &str,
                               scope_id: NodeId) {
         let id = self.normalize_node_id(id);
+        let ctor_id = id;
         let scope_id = self.normalize_node_id(scope_id);
-        let ctor_id = self.normalize_node_id(ctor_id);
         self.check_and_record(VariantStruct,
                               span,
                               sub_span,
@@ -685,5 +695,20 @@ impl<'a, 'tcx: 'a> FmtStrs<'a, 'tcx> {
                               span,
                               sub_span,
                               svec!(id.index.as_usize(), id.krate, "", scope_id));
+    }
+
+    pub fn macro_str(&mut self, span: Span, sub_span: Span, name: String, qualname: String) {
+        self.record_with_span(Macro, span, sub_span, svec!(name, qualname));
+    }
+
+    pub fn macro_use_str(&mut self,
+                         span: Span,
+                         sub_span: Span,
+                         name: String,
+                         qualname: String,
+                         scope_id: NodeId) {
+        let scope_id = self.normalize_node_id(scope_id);
+        self.record_with_span(MacroUse, span, sub_span,
+                              svec!(name, qualname, scope_id));
     }
 }

@@ -157,7 +157,7 @@ impl Utf8Error {
     /// // std::str::from_utf8 returns a Utf8Error
     /// let error = str::from_utf8(&sparkle_heart).unwrap_err();
     ///
-    /// // the first byte is invalid here
+    /// // the second byte is invalid here
     /// assert_eq!(1, error.valid_up_to());
     /// ```
     #[stable(feature = "utf8_error", since = "1.5.0")]
@@ -174,10 +174,10 @@ impl Utf8Error {
 ///
 /// If you are sure that the byte slice is valid UTF-8, and you don't want to
 /// incur the overhead of the validity check, there is an unsafe version of
-/// this function, [`from_utf8_unchecked()`][fromutf8], which has the same
+/// this function, [`from_utf8_unchecked()`][fromutf8u], which has the same
 /// behavior but skips the check.
 ///
-/// [fromutf8]: fn.from_utf8.html
+/// [fromutf8u]: fn.from_utf8_unchecked.html
 ///
 /// If you need a `String` instead of a `&str`, consider
 /// [`String::from_utf8()`][string].
@@ -188,7 +188,7 @@ impl Utf8Error {
 /// it, this function is one way to have a stack-allocated string. There is
 /// an example of this in the examples section below.
 ///
-/// # Failure
+/// # Errors
 ///
 /// Returns `Err` if the slice is not UTF-8 with a description as to why the
 /// provided slice is not UTF-8.
@@ -240,14 +240,42 @@ impl Utf8Error {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
-    try!(run_utf8_validation_iterator(&mut v.iter()));
+    try!(run_utf8_validation(v));
     Ok(unsafe { from_utf8_unchecked(v) })
+}
+
+/// Forms a str from a pointer and a length.
+///
+/// The `len` argument is the number of bytes in the string.
+///
+/// # Safety
+///
+/// This function is unsafe as there is no guarantee that the given pointer is
+/// valid for `len` bytes, nor whether the lifetime inferred is a suitable
+/// lifetime for the returned str.
+///
+/// The data must be valid UTF-8
+///
+/// `p` must be non-null, even for zero-length str.
+///
+/// # Caveat
+///
+/// The lifetime for the returned str is inferred from its usage. To
+/// prevent accidental misuse, it's suggested to tie the lifetime to whichever
+/// source lifetime is safe in the context, such as by providing a helper
+/// function taking the lifetime of a host value for the str, or by explicit
+/// annotation.
+/// Performs the same functionality as `from_raw_parts`, except that a mutable
+/// str is returned.
+///
+unsafe fn from_raw_parts_mut<'a>(p: *mut u8, len: usize) -> &'a mut str {
+    mem::transmute::<&mut [u8], &mut str>(slice::from_raw_parts_mut(p, len))
 }
 
 /// Converts a slice of bytes to a string slice without checking
 /// that the string contains valid UTF-8.
 ///
-/// See the safe version, [`from_utf8()`][fromutf8], for more.
+/// See the safe version, [`from_utf8()`][fromutf8], for more information.
 ///
 /// [fromutf8]: fn.from_utf8.html
 ///
@@ -292,7 +320,9 @@ Section: Iterators
 
 /// Iterator for the char (representing *Unicode Scalar Values*) of a string
 ///
-/// Created with the method `.chars()`.
+/// Created with the method [`chars()`].
+///
+/// [`chars()`]: ../primitive.str.html#method.chars
 #[derive(Clone)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Chars<'a> {
@@ -499,7 +529,9 @@ impl<'a> CharIndices<'a> {
 /// External iterator for a string's bytes.
 /// Use with the `std::iter` module.
 ///
-/// Created with the method `.bytes()`.
+/// Created with the method [`bytes()`].
+///
+/// [`bytes()`]: ../primitive.str.html#method.bytes
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
 pub struct Bytes<'a>(Cloned<slice::Iter<'a, u8>>);
@@ -782,10 +814,14 @@ impl<'a, P: Pattern<'a>> SplitInternal<'a, P> {
 
 generate_pattern_iterators! {
     forward:
-        /// Created with the method `.split()`.
+        /// Created with the method [`split()`].
+        ///
+        /// [`split()`]: ../primitive.str.html#method.split
         struct Split;
     reverse:
-        /// Created with the method `.rsplit()`.
+        /// Created with the method [`rsplit()`].
+        ///
+        /// [`rsplit()`]: ../primitive.str.html#method.rsplit
         struct RSplit;
     stability:
         #[stable(feature = "rust1", since = "1.0.0")]
@@ -796,10 +832,14 @@ generate_pattern_iterators! {
 
 generate_pattern_iterators! {
     forward:
-        /// Created with the method `.split_terminator()`.
+        /// Created with the method [`split_terminator()`].
+        ///
+        /// [`split_terminator()`]: ../primitive.str.html#method.split_terminator
         struct SplitTerminator;
     reverse:
-        /// Created with the method `.rsplit_terminator()`.
+        /// Created with the method [`rsplit_terminator()`].
+        ///
+        /// [`rsplit_terminator()`]: ../primitive.str.html#method.rsplit_terminator
         struct RSplitTerminator;
     stability:
         #[stable(feature = "rust1", since = "1.0.0")]
@@ -842,10 +882,14 @@ impl<'a, P: Pattern<'a>> SplitNInternal<'a, P> {
 
 generate_pattern_iterators! {
     forward:
-        /// Created with the method `.splitn()`.
+        /// Created with the method [`splitn()`].
+        ///
+        /// [`splitn()`]: ../primitive.str.html#method.splitn
         struct SplitN;
     reverse:
-        /// Created with the method `.rsplitn()`.
+        /// Created with the method [`rsplitn()`].
+        ///
+        /// [`rsplitn()`]: ../primitive.str.html#method.rsplitn
         struct RSplitN;
     stability:
         #[stable(feature = "rust1", since = "1.0.0")]
@@ -880,10 +924,14 @@ impl<'a, P: Pattern<'a>> MatchIndicesInternal<'a, P> {
 
 generate_pattern_iterators! {
     forward:
-        /// Created with the method `.match_indices()`.
+        /// Created with the method [`match_indices()`].
+        ///
+        /// [`match_indices()`]: ../primitive.str.html#method.match_indices
         struct MatchIndices;
     reverse:
-        /// Created with the method `.rmatch_indices()`.
+        /// Created with the method [`rmatch_indices()`].
+        ///
+        /// [`rmatch_indices()`]: ../primitive.str.html#method.rmatch_indices
         struct RMatchIndices;
     stability:
         #[stable(feature = "str_match_indices", since = "1.5.0")]
@@ -920,10 +968,14 @@ impl<'a, P: Pattern<'a>> MatchesInternal<'a, P> {
 
 generate_pattern_iterators! {
     forward:
-        /// Created with the method `.matches()`.
+        /// Created with the method [`matches()`].
+        ///
+        /// [`matches()`]: ../primitive.str.html#method.matches
         struct Matches;
     reverse:
-        /// Created with the method `.rmatches()`.
+        /// Created with the method [`rmatches()`].
+        ///
+        /// [`rmatches()`]: ../primitive.str.html#method.rmatches
         struct RMatches;
     stability:
         #[stable(feature = "str_matches", since = "1.2.0")]
@@ -932,7 +984,9 @@ generate_pattern_iterators! {
     delegate double ended;
 }
 
-/// Created with the method `.lines()`.
+/// Created with the method [`lines()`].
+///
+/// [`lines()`]: ../primitive.str.html#method.lines
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
 pub struct Lines<'a>(Map<SplitTerminator<'a, char>, LinesAnyMap>);
@@ -960,7 +1014,9 @@ impl<'a> DoubleEndedIterator for Lines<'a> {
     }
 }
 
-/// Created with the method `.lines_any()`.
+/// Created with the method [`lines_any()`].
+///
+/// [`lines_any()`]: ../primitive.str.html#method.lines_any
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_deprecated(since = "1.4.0", reason = "use lines()/Lines instead now")]
 #[derive(Clone)]
@@ -1046,46 +1102,44 @@ unsafe fn cmp_slice(a: &str, b: &str, len: usize) -> i32 {
 }
 
 /*
-Section: Misc
+Section: UTF-8 validation
 */
+
+// use truncation to fit u64 into usize
+const NONASCII_MASK: usize = 0x80808080_80808080u64 as usize;
+
+/// Return `true` if any byte in the word `x` is nonascii (>= 128).
+#[inline]
+fn contains_nonascii(x: usize) -> bool {
+    (x & NONASCII_MASK) != 0
+}
 
 /// Walk through `iter` checking that it's a valid UTF-8 sequence,
 /// returning `true` in that case, or, if it is invalid, `false` with
 /// `iter` reset such that it is pointing at the first byte in the
 /// invalid sequence.
 #[inline(always)]
-fn run_utf8_validation_iterator(iter: &mut slice::Iter<u8>)
-                                -> Result<(), Utf8Error> {
-    let whole = iter.as_slice();
-    loop {
-        // save the current thing we're pointing at.
-        let old = iter.clone();
-
-        // restore the iterator we had at the start of this codepoint.
+fn run_utf8_validation(v: &[u8]) -> Result<(), Utf8Error> {
+    let mut offset = 0;
+    let len = v.len();
+    while offset < len {
+        let old_offset = offset;
         macro_rules! err { () => {{
-            *iter = old.clone();
             return Err(Utf8Error {
-                valid_up_to: whole.len() - iter.as_slice().len()
+                valid_up_to: old_offset
             })
         }}}
 
-        macro_rules! next { () => {
-            match iter.next() {
-                Some(a) => *a,
-                // we needed data, but there was none: error!
-                None => err!(),
+        macro_rules! next { () => {{
+            offset += 1;
+            // we needed data, but there was none: error!
+            if offset >= len {
+                err!()
             }
-        }}
+            v[offset]
+        }}}
 
-        let first = match iter.next() {
-            Some(&b) => b,
-            // we're at the end of the iterator and a codepoint
-            // boundary at the same time, so this string is valid.
-            None => return Ok(())
-        };
-
-        // ASCII characters are always valid, so only large
-        // bytes need more examination.
+        let first = v[offset];
         if first >= 128 {
             let w = UTF8_CHAR_WIDTH[first as usize];
             let second = next!();
@@ -1128,8 +1182,43 @@ fn run_utf8_validation_iterator(iter: &mut slice::Iter<u8>)
                 }
                 _ => err!()
             }
+            offset += 1;
+        } else {
+            // Ascii case, try to skip forward quickly.
+            // When the pointer is aligned, read 2 words of data per iteration
+            // until we find a word containing a non-ascii byte.
+            let usize_bytes = mem::size_of::<usize>();
+            let bytes_per_iteration = 2 * usize_bytes;
+            let ptr = v.as_ptr();
+            let align = (ptr as usize + offset) & (usize_bytes - 1);
+            if align == 0 {
+                if len >= bytes_per_iteration {
+                    while offset <= len - bytes_per_iteration {
+                        unsafe {
+                            let u = *(ptr.offset(offset as isize) as *const usize);
+                            let v = *(ptr.offset((offset + usize_bytes) as isize) as *const usize);
+
+                            // break if there is a nonascii byte
+                            let zu = contains_nonascii(u);
+                            let zv = contains_nonascii(v);
+                            if zu || zv {
+                                break;
+                            }
+                        }
+                        offset += bytes_per_iteration;
+                    }
+                }
+                // step from the point where the wordwise loop stopped
+                while offset < len && v[offset] < 128 {
+                    offset += 1;
+                }
+            } else {
+                offset += 1;
+            }
         }
     }
+
+    Ok(())
 }
 
 // https://tools.ietf.org/html/rfc3629
@@ -1651,7 +1740,7 @@ impl StrExt for str {
         let mut matcher = pat.into_searcher(self);
         if let Some((a, b)) = matcher.next_reject() {
             i = a;
-            j = b; // Rember earliest known match, correct it below if
+            j = b; // Remember earliest known match, correct it below if
                    // last match is different
         }
         if let Some((_, b)) = matcher.next_reject_back() {
@@ -1782,10 +1871,10 @@ impl StrExt for str {
         // is_char_boundary checks that the index is in [0, .len()]
         if self.is_char_boundary(mid) {
             let len = self.len();
+            let ptr = self.as_ptr() as *mut u8;
             unsafe {
-                let self2: &mut str = mem::transmute_copy(&self);
-                (self.slice_mut_unchecked(0, mid),
-                 self2.slice_mut_unchecked(mid, len))
+                (from_raw_parts_mut(ptr, mid),
+                 from_raw_parts_mut(ptr.offset(mid as isize), len - mid))
             }
         } else {
             slice_error_fail(self, 0, mid)
@@ -1805,7 +1894,7 @@ impl StrExt for str {
 
     #[inline]
     fn as_ptr(&self) -> *const u8 {
-        self.repr().data
+        self as *const str as *const u8
     }
 
     #[inline]

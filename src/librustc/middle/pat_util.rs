@@ -10,12 +10,11 @@
 
 use middle::def::*;
 use middle::def_id::DefId;
-use middle::ty;
+use middle::ty::TyCtxt;
 use util::nodemap::FnvHashMap;
 
 use syntax::ast;
-use syntax::ext::mtwt;
-use rustc_front::hir;
+use rustc_front::hir::{self, PatKind};
 use rustc_front::util::walk_pat;
 use syntax::codemap::{respan, Span, Spanned, DUMMY_SP};
 
@@ -27,35 +26,37 @@ pub type PatIdMap = FnvHashMap<ast::Name, ast::NodeId>;
 // use the NodeId of their namesake in the first pattern.
 pub fn pat_id_map(dm: &RefCell<DefMap>, pat: &hir::Pat) -> PatIdMap {
     let mut map = FnvHashMap();
-    pat_bindings_hygienic(dm, pat, |_bm, p_id, _s, path1| {
-        map.insert(mtwt::resolve(path1.node), p_id);
+    pat_bindings(dm, pat, |_bm, p_id, _s, path1| {
+        map.insert(path1.node, p_id);
     });
     map
 }
 
 pub fn pat_is_refutable(dm: &DefMap, pat: &hir::Pat) -> bool {
     match pat.node {
-        hir::PatLit(_) | hir::PatRange(_, _) | hir::PatQPath(..) => true,
-        hir::PatEnum(_, _) |
-        hir::PatIdent(_, _, None) |
-        hir::PatStruct(..) => {
+        PatKind::Lit(_) | PatKind::Range(_, _) | PatKind::QPath(..) => true,
+        PatKind::TupleStruct(..) |
+        PatKind::Path(..) |
+        PatKind::Ident(_, _, None) |
+        PatKind::Struct(..) => {
             match dm.get(&pat.id).map(|d| d.full_def()) {
-                Some(DefVariant(..)) => true,
+                Some(Def::Variant(..)) => true,
                 _ => false
             }
         }
-        hir::PatVec(_, _, _) => true,
+        PatKind::Vec(_, _, _) => true,
         _ => false
     }
 }
 
 pub fn pat_is_variant_or_struct(dm: &DefMap, pat: &hir::Pat) -> bool {
     match pat.node {
-        hir::PatEnum(_, _) |
-        hir::PatIdent(_, _, None) |
-        hir::PatStruct(..) => {
+        PatKind::TupleStruct(..) |
+        PatKind::Path(..) |
+        PatKind::Ident(_, _, None) |
+        PatKind::Struct(..) => {
             match dm.get(&pat.id).map(|d| d.full_def()) {
-                Some(DefVariant(..)) | Some(DefStruct(..)) => true,
+                Some(Def::Variant(..)) | Some(Def::Struct(..)) | Some(Def::TyAlias(..)) => true,
                 _ => false
             }
         }
@@ -65,9 +66,9 @@ pub fn pat_is_variant_or_struct(dm: &DefMap, pat: &hir::Pat) -> bool {
 
 pub fn pat_is_const(dm: &DefMap, pat: &hir::Pat) -> bool {
     match pat.node {
-        hir::PatIdent(_, _, None) | hir::PatEnum(..) | hir::PatQPath(..) => {
+        PatKind::Ident(_, _, None) | PatKind::Path(..) | PatKind::QPath(..) => {
             match dm.get(&pat.id).map(|d| d.full_def()) {
-                Some(DefConst(..)) | Some(DefAssociatedConst(..)) => true,
+                Some(Def::Const(..)) | Some(Def::AssociatedConst(..)) => true,
                 _ => false
             }
         }
@@ -79,11 +80,11 @@ pub fn pat_is_const(dm: &DefMap, pat: &hir::Pat) -> bool {
 // returned instead of a panic.
 pub fn pat_is_resolved_const(dm: &DefMap, pat: &hir::Pat) -> bool {
     match pat.node {
-        hir::PatIdent(_, _, None) | hir::PatEnum(..) | hir::PatQPath(..) => {
+        PatKind::Ident(_, _, None) | PatKind::Path(..) | PatKind::QPath(..) => {
             match dm.get(&pat.id)
                     .and_then(|d| if d.depth == 0 { Some(d.base_def) }
                                   else { None } ) {
-                Some(DefConst(..)) | Some(DefAssociatedConst(..)) => true,
+                Some(Def::Const(..)) | Some(Def::AssociatedConst(..)) => true,
                 _ => false
             }
         }
@@ -93,7 +94,7 @@ pub fn pat_is_resolved_const(dm: &DefMap, pat: &hir::Pat) -> bool {
 
 pub fn pat_is_binding(dm: &DefMap, pat: &hir::Pat) -> bool {
     match pat.node {
-        hir::PatIdent(..) => {
+        PatKind::Ident(..) => {
             !pat_is_variant_or_struct(dm, pat) &&
             !pat_is_const(dm, pat)
         }
@@ -103,8 +104,8 @@ pub fn pat_is_binding(dm: &DefMap, pat: &hir::Pat) -> bool {
 
 pub fn pat_is_binding_or_wild(dm: &DefMap, pat: &hir::Pat) -> bool {
     match pat.node {
-        hir::PatIdent(..) => pat_is_binding(dm, pat),
-        hir::PatWild => true,
+        PatKind::Ident(..) => pat_is_binding(dm, pat),
+        PatKind::Wild => true,
         _ => false
     }
 }
@@ -116,7 +117,7 @@ pub fn pat_bindings<I>(dm: &RefCell<DefMap>, pat: &hir::Pat, mut it: I) where
 {
     walk_pat(pat, |p| {
         match p.node {
-          hir::PatIdent(binding_mode, ref pth, _) if pat_is_binding(&dm.borrow(), p) => {
+          PatKind::Ident(binding_mode, ref pth, _) if pat_is_binding(&dm.borrow(), p) => {
             it(binding_mode, p.id, p.span, &respan(pth.span, pth.node.name));
           }
           _ => {}
@@ -124,13 +125,12 @@ pub fn pat_bindings<I>(dm: &RefCell<DefMap>, pat: &hir::Pat, mut it: I) where
         true
     });
 }
-
-pub fn pat_bindings_hygienic<I>(dm: &RefCell<DefMap>, pat: &hir::Pat, mut it: I) where
-    I: FnMut(hir::BindingMode, ast::NodeId, Span, &Spanned<ast::Ident>),
+pub fn pat_bindings_ident<I>(dm: &RefCell<DefMap>, pat: &hir::Pat, mut it: I) where
+    I: FnMut(hir::BindingMode, ast::NodeId, Span, &Spanned<hir::Ident>),
 {
     walk_pat(pat, |p| {
         match p.node {
-          hir::PatIdent(binding_mode, ref pth, _) if pat_is_binding(&dm.borrow(), p) => {
+          PatKind::Ident(binding_mode, ref pth, _) if pat_is_binding(&dm.borrow(), p) => {
             it(binding_mode, p.id, p.span, &respan(pth.span, pth.node));
           }
           _ => {}
@@ -155,7 +155,7 @@ pub fn pat_contains_bindings(dm: &DefMap, pat: &hir::Pat) -> bool {
 }
 
 /// Checks if the pattern contains any `ref` or `ref mut` bindings,
-/// and if yes wether its containing mutable ones or just immutables ones.
+/// and if yes whether its containing mutable ones or just immutables ones.
 pub fn pat_contains_ref_binding(dm: &RefCell<DefMap>, pat: &hir::Pat) -> Option<hir::Mutability> {
     let mut result = None;
     pat_bindings(dm, pat, |mode, _, _, _| {
@@ -174,7 +174,7 @@ pub fn pat_contains_ref_binding(dm: &RefCell<DefMap>, pat: &hir::Pat) -> Option<
 }
 
 /// Checks if the patterns for this arm contain any `ref` or `ref mut`
-/// bindings, and if yes wether its containing mutable ones or just immutables ones.
+/// bindings, and if yes whether its containing mutable ones or just immutables ones.
 pub fn arm_contains_ref_binding(dm: &RefCell<DefMap>, arm: &hir::Arm) -> Option<hir::Mutability> {
     arm.pats.iter()
             .filter_map(|pat| pat_contains_ref_binding(dm, pat))
@@ -201,7 +201,7 @@ pub fn pat_contains_bindings_or_wild(dm: &DefMap, pat: &hir::Pat) -> bool {
 
 pub fn simple_name<'a>(pat: &'a hir::Pat) -> Option<ast::Name> {
     match pat.node {
-        hir::PatIdent(hir::BindByValue(_), ref path1, None) => {
+        PatKind::Ident(hir::BindByValue(_), ref path1, None) => {
             Some(path1.node.name)
         }
         _ => {
@@ -210,11 +210,11 @@ pub fn simple_name<'a>(pat: &'a hir::Pat) -> Option<ast::Name> {
     }
 }
 
-pub fn def_to_path(tcx: &ty::ctxt, id: DefId) -> hir::Path {
+pub fn def_to_path(tcx: &TyCtxt, id: DefId) -> hir::Path {
     tcx.with_path(id, |path| hir::Path {
         global: false,
         segments: path.last().map(|elem| hir::PathSegment {
-            identifier: ast::Ident::with_empty_ctxt(elem.name()),
+            identifier: hir::Ident::from_name(elem.name()),
             parameters: hir::PathParameters::none(),
         }).into_iter().collect(),
         span: DUMMY_SP,
@@ -226,11 +226,12 @@ pub fn necessary_variants(dm: &DefMap, pat: &hir::Pat) -> Vec<DefId> {
     let mut variants = vec![];
     walk_pat(pat, |p| {
         match p.node {
-            hir::PatEnum(_, _) |
-            hir::PatIdent(_, _, None) |
-            hir::PatStruct(..) => {
+            PatKind::TupleStruct(..) |
+            PatKind::Path(..) |
+            PatKind::Ident(_, _, None) |
+            PatKind::Struct(..) => {
                 match dm.get(&p.id) {
-                    Some(&PathResolution { base_def: DefVariant(_, id, _), .. }) => {
+                    Some(&PathResolution { base_def: Def::Variant(_, id), .. }) => {
                         variants.push(id);
                     }
                     _ => ()

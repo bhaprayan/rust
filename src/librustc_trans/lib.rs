@@ -14,16 +14,14 @@
 //!
 //! This API is completely unstable and subject to change.
 
-// Do not remove on snapshot creation. Needed for bootstrap. (Issue #22364)
-#![cfg_attr(stage0, feature(custom_attribute))]
 #![crate_name = "rustc_trans"]
 #![unstable(feature = "rustc_private", issue = "27812")]
-#![cfg_attr(stage0, staged_api)]
 #![crate_type = "dylib"]
 #![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
+#![cfg_attr(not(stage0), deny(warnings))]
 
 #![feature(box_patterns)]
 #![feature(box_syntax)]
@@ -32,15 +30,12 @@
 #![allow(unused_attributes)]
 #![feature(iter_arith)]
 #![feature(libc)]
-#![feature(path_relative_from)]
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(rustc_private)]
 #![feature(slice_patterns)]
 #![feature(staged_api)]
 #![feature(unicode)]
-
-#![allow(trivial_casts)]
 
 extern crate arena;
 extern crate flate;
@@ -51,7 +46,7 @@ extern crate rustc;
 extern crate rustc_back;
 extern crate rustc_data_structures;
 extern crate rustc_front;
-extern crate rustc_llvm as llvm;
+pub extern crate rustc_llvm as llvm;
 extern crate rustc_mir;
 extern crate rustc_platform_intrinsics as intrinsics;
 extern crate serialize;

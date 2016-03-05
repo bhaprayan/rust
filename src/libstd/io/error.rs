@@ -150,12 +150,7 @@ pub enum ErrorKind {
     #[stable(feature = "rust1", since = "1.0.0")]
     Other,
 
-    /// An error returned when an operation could not be completed because an
-    /// "end of file" was reached prematurely.
-    ///
-    /// This typically means that an operation could only succeed if it read a
-    /// particular number of bytes but only a smaller number of bytes could be
-    /// read.
+    #[allow(missing_docs)]
     #[unstable(feature = "read_exact_old", reason = "recently added",
                issue = "0")]
     #[rustc_deprecated(since = "1.6.0", reason = "renamed to UnexpectedEof")]
@@ -316,9 +311,31 @@ impl fmt::Display for Error {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl error::Error for Error {
+    #[allow(deprecated)] // remove with UnexpectedEOF
     fn description(&self) -> &str {
         match self.repr {
-            Repr::Os(..) => "os error",
+            Repr::Os(..) => match self.kind() {
+                ErrorKind::NotFound => "entity not found",
+                ErrorKind::PermissionDenied => "permission denied",
+                ErrorKind::ConnectionRefused => "connection refused",
+                ErrorKind::ConnectionReset => "connection reset",
+                ErrorKind::ConnectionAborted => "connection aborted",
+                ErrorKind::NotConnected => "not connected",
+                ErrorKind::AddrInUse => "address in use",
+                ErrorKind::AddrNotAvailable => "address not available",
+                ErrorKind::BrokenPipe => "broken pipe",
+                ErrorKind::AlreadyExists => "entity already exists",
+                ErrorKind::WouldBlock => "operation would block",
+                ErrorKind::InvalidInput => "invalid input parameter",
+                ErrorKind::InvalidData => "invalid data",
+                ErrorKind::TimedOut => "timed out",
+                ErrorKind::WriteZero => "write zero",
+                ErrorKind::Interrupted => "operation interrupted",
+                ErrorKind::Other => "other os error",
+                ErrorKind::UnexpectedEOF => "unexpected end of file",
+                ErrorKind::UnexpectedEof => "unexpected end of file",
+                ErrorKind::__Nonexhaustive => unreachable!()
+            },
             Repr::Custom(ref c) => c.error.description(),
         }
     }
@@ -360,7 +377,7 @@ mod test {
         struct TestError;
 
         impl fmt::Display for TestError {
-            fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+            fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
                 Ok(())
             }
         }

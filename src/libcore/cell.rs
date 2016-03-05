@@ -242,6 +242,9 @@ impl<T:Copy> Cell<T> {
 unsafe impl<T> Send for Cell<T> where T: Send {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
+impl<T> !Sync for Cell<T> {}
+
+#[stable(feature = "rust1", since = "1.0.0")]
 impl<T:Copy> Clone for Cell<T> {
     #[inline]
     fn clone(&self) -> Cell<T> {
@@ -414,7 +417,9 @@ impl<T: ?Sized> RefCell<T> {
     ///
     /// let c = RefCell::new(5);
     ///
-    /// let borrowed_five = c.borrow_mut();
+    /// *c.borrow_mut() = 7;
+    ///
+    /// assert_eq!(*c.borrow(), 7);
     /// ```
     ///
     /// An example of panic:
@@ -458,6 +463,9 @@ impl<T: ?Sized> RefCell<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 unsafe impl<T: ?Sized> Send for RefCell<T> where T: Send {}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl<T: ?Sized> !Sync for RefCell<T> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone> Clone for RefCell<T> {
@@ -577,8 +585,6 @@ impl<'b, T: ?Sized> Ref<'b, T> {
     /// # Example
     ///
     /// ```
-    /// #![feature(cell_extras)]
-    ///
     /// use std::cell::{RefCell, Ref};
     ///
     /// let c = RefCell::new((5, 'b'));
@@ -586,8 +592,7 @@ impl<'b, T: ?Sized> Ref<'b, T> {
     /// let b2: Ref<u32> = Ref::map(b1, |t| &t.0);
     /// assert_eq!(*b2, 5)
     /// ```
-    #[unstable(feature = "cell_extras", reason = "recently added",
-               issue = "27746")]
+    #[stable(feature = "cell_map", since = "1.8.0")]
     #[inline]
     pub fn map<U: ?Sized, F>(orig: Ref<'b, T>, f: F) -> Ref<'b, U>
         where F: FnOnce(&T) -> &U
@@ -620,6 +625,7 @@ impl<'b, T: ?Sized> Ref<'b, T> {
     /// ```
     #[unstable(feature = "cell_extras", reason = "recently added",
                issue = "27746")]
+    #[rustc_deprecated(since = "1.8.0", reason = "can be built on Ref::map")]
     #[inline]
     pub fn filter_map<U: ?Sized, F>(orig: Ref<'b, T>, f: F) -> Option<Ref<'b, U>>
         where F: FnOnce(&T) -> Option<&U>
@@ -644,7 +650,6 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
     /// # Example
     ///
     /// ```
-    /// # #![feature(cell_extras)]
     /// use std::cell::{RefCell, RefMut};
     ///
     /// let c = RefCell::new((5, 'b'));
@@ -656,8 +661,7 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
     /// }
     /// assert_eq!(*c.borrow(), (42, 'b'));
     /// ```
-    #[unstable(feature = "cell_extras", reason = "recently added",
-               issue = "27746")]
+    #[stable(feature = "cell_map", since = "1.8.0")]
     #[inline]
     pub fn map<U: ?Sized, F>(orig: RefMut<'b, T>, f: F) -> RefMut<'b, U>
         where F: FnOnce(&mut T) -> &mut U
@@ -696,6 +700,7 @@ impl<'b, T: ?Sized> RefMut<'b, T> {
     /// ```
     #[unstable(feature = "cell_extras", reason = "recently added",
                issue = "27746")]
+    #[rustc_deprecated(since = "1.8.0", reason = "can be built on RefMut::map")]
     #[inline]
     pub fn filter_map<U: ?Sized, F>(orig: RefMut<'b, T>, f: F) -> Option<RefMut<'b, U>>
         where F: FnOnce(&mut T) -> Option<&mut U>

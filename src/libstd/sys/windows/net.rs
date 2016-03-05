@@ -8,8 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use cmp;
 use io;
-use libc::{c_int, c_void};
+use libc::{c_int, c_void, c_ulong};
 use mem;
 use net::{SocketAddr, Shutdown};
 use num::One;
@@ -131,9 +132,9 @@ impl Socket {
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         // On unix when a socket is shut down all further reads return 0, so we
         // do the same on windows to map a shut down socket to returning EOF.
+        let len = cmp::min(buf.len(), i32::max_value() as usize) as i32;
         unsafe {
-            match c::recv(self.0, buf.as_mut_ptr() as *mut c_void,
-                             buf.len() as i32, 0) {
+            match c::recv(self.0, buf.as_mut_ptr() as *mut c_void, len, 0) {
                 -1 if c::WSAGetLastError() == c::WSAESHUTDOWN => Ok(0),
                 -1 => Err(last_error()),
                 n => Ok(n as usize)
@@ -183,6 +184,25 @@ impl Socket {
         };
         try!(cvt(unsafe { c::shutdown(self.0, how) }));
         Ok(())
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        let mut nonblocking = nonblocking as c_ulong;
+        let r = unsafe { c::ioctlsocket(self.0, c::FIONBIO as c_int, &mut nonblocking) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        net::setsockopt(self, c::IPPROTO_TCP, c::TCP_NODELAY, nodelay as c::BYTE)
+    }
+
+    pub fn nodelay(&self) -> io::Result<bool> {
+        let raw: c::BYTE = try!(net::getsockopt(self, c::IPPROTO_TCP, c::TCP_NODELAY));
+        Ok(raw != 0)
     }
 }
 

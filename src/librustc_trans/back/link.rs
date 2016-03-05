@@ -23,7 +23,7 @@ use session::Session;
 use middle::cstore::{self, CrateStore, LinkMeta};
 use middle::cstore::{LinkagePreference, NativeLibraryKind};
 use middle::dependency_format::Linkage;
-use middle::ty::{self, Ty};
+use middle::ty::{Ty, TyCtxt};
 use rustc::front::map::DefPath;
 use trans::{CrateContext, CrateTranslation, gensym_name};
 use util::common::time;
@@ -182,8 +182,10 @@ pub fn find_crate_name(sess: Option<&Session>,
     "rust_out".to_string()
 }
 
-pub fn build_link_meta(sess: &Session, krate: &hir::Crate,
-                       name: &str) -> LinkMeta {
+pub fn build_link_meta(sess: &Session,
+                       krate: &hir::Crate,
+                       name: &str)
+                       -> LinkMeta {
     let r = LinkMeta {
         crate_name: name.to_owned(),
         crate_hash: Svh::calculate(&sess.opts.cg.metadata, krate),
@@ -200,7 +202,7 @@ fn truncated_hash_result(symbol_hasher: &mut Sha256) -> String {
 
 
 // This calculates STH for a symbol, as defined above
-fn symbol_hash<'tcx>(tcx: &ty::ctxt<'tcx>,
+fn symbol_hash<'tcx>(tcx: &TyCtxt<'tcx>,
                      symbol_hasher: &mut Sha256,
                      t: Ty<'tcx>,
                      link_meta: &LinkMeta)
@@ -224,9 +226,8 @@ fn symbol_hash<'tcx>(tcx: &ty::ctxt<'tcx>,
 }
 
 fn get_symbol_hash<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>, t: Ty<'tcx>) -> String {
-    match ccx.type_hashcodes().borrow().get(&t) {
-        Some(h) => return h.to_string(),
-        None => {}
+    if let Some(h) = ccx.type_hashcodes().borrow().get(&t) {
+        return h.to_string()
     }
 
     let mut symbol_hasher = ccx.symbol_hasher().borrow_mut();
@@ -313,9 +314,8 @@ pub fn mangle<PI: Iterator<Item=InternedString>>(path: PI, hash: Option<&str>) -
         push(&mut n, &data);
     }
 
-    match hash {
-        Some(s) => push(&mut n, s),
-        None => {}
+    if let Some(s) = hash {
+        push(&mut n, s)
     }
 
     n.push('E'); // End name-sequence.
@@ -393,6 +393,9 @@ fn command_path(sess: &Session) -> OsString {
                            .get_tools_search_paths();
     if let Some(path) = env::var_os("PATH") {
         new_path.extend(env::split_paths(&path));
+    }
+    if sess.target.target.options.is_like_msvc {
+        new_path.extend(msvc::host_dll_path());
     }
     env::join_paths(new_path).unwrap()
 }
@@ -488,7 +491,10 @@ pub fn filename_for_input(sess: &Session,
                                                 suffix))
         }
         config::CrateTypeStaticlib => {
-            outputs.out_directory.join(&format!("lib{}.a", libname))
+            let (prefix, suffix) = (&sess.target.target.options.staticlib_prefix,
+                                    &sess.target.target.options.staticlib_suffix);
+            outputs.out_directory.join(&format!("{}{}{}", prefix, libname,
+                                                suffix))
         }
         config::CrateTypeExecutable => {
             let suffix = &sess.target.target.options.exe_suffix;
@@ -817,10 +823,10 @@ fn link_staticlib(sess: &Session, objects: &[PathBuf], out_filename: &Path,
     ab.build();
 
     if !all_native_libs.is_empty() {
-        sess.note("link against the following native artifacts when linking against \
-                  this static library");
-        sess.note("the order and any duplication can be significant on some platforms, \
-                  and so may need to be preserved");
+        sess.note_without_error("link against the following native artifacts when linking against \
+                                 this static library");
+        sess.note_without_error("the order and any duplication can be significant on some \
+                                 platforms, and so may need to be preserved");
     }
 
     for &(kind, ref lib) in &all_native_libs {
@@ -829,7 +835,7 @@ fn link_staticlib(sess: &Session, objects: &[PathBuf], out_filename: &Path,
             NativeLibraryKind::NativeUnknown => "library",
             NativeLibraryKind::NativeFramework => "framework",
         };
-        sess.note(&format!("{}: {}", name, *lib));
+        sess.note_without_error(&format!("{}: {}", name, *lib));
     }
 }
 
@@ -902,13 +908,14 @@ fn link_natively(sess: &Session, dylib: bool,
                     })
             }
             if !prog.status.success() {
-                sess.err(&format!("linking with `{}` failed: {}",
-                                 pname,
-                                 prog.status));
-                sess.note(&format!("{:?}", &cmd));
                 let mut output = prog.stderr.clone();
                 output.extend_from_slice(&prog.stdout);
-                sess.note(&*escape_string(&output[..]));
+                sess.struct_err(&format!("linking with `{}` failed: {}",
+                                         pname,
+                                         prog.status))
+                    .note(&format!("{:?}", &cmd))
+                    .note(&escape_string(&output[..]))
+                    .emit();
                 sess.abort_if_errors();
             }
             info!("linker stderr:\n{}", escape_string(&prog.stderr[..]));
@@ -967,7 +974,9 @@ fn link_args(cmd: &mut Linker,
 
     // Try to strip as much out of the generated object by removing unused
     // sections if possible. See more comments in linker.rs
-    cmd.gc_sections(dylib);
+    if !sess.opts.cg.link_dead_code {
+        cmd.gc_sections(dylib);
+    }
 
     let used_link_args = sess.cstore.used_link_args();
 
@@ -1054,6 +1063,7 @@ fn link_args(cmd: &mut Linker,
             out_filename: out_filename.to_path_buf(),
             has_rpath: sess.target.target.options.has_rpath,
             is_like_osx: sess.target.target.options.is_like_osx,
+            linker_is_gnu: sess.target.target.options.linker_is_gnu,
             get_install_prefix_lib_path: &mut get_install_prefix_lib_path,
         };
         cmd.args(&rpath::get_rpath_flags(&mut rpath_config));
@@ -1241,7 +1251,11 @@ fn add_upstream_rust_crates(cmd: &mut Linker, sess: &Session,
 
             if any_objects {
                 archive.build();
-                cmd.link_whole_rlib(&fix_windows_verbatim_for_gcc(&dst));
+                if dylib {
+                    cmd.link_whole_rlib(&fix_windows_verbatim_for_gcc(&dst));
+                } else {
+                    cmd.link_rlib(&fix_windows_verbatim_for_gcc(&dst));
+                }
             }
         });
     }

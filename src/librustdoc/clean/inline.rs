@@ -17,9 +17,9 @@ use syntax::attr::AttrMetaMethods;
 use rustc_front::hir;
 
 use rustc::middle::cstore::{self, CrateStore};
-use rustc::middle::def;
+use rustc::middle::def::Def;
 use rustc::middle::def_id::DefId;
-use rustc::middle::ty;
+use rustc::middle::ty::{self, TyCtxt};
 use rustc::middle::subst;
 use rustc::middle::stability;
 use rustc::middle::const_eval;
@@ -67,47 +67,48 @@ pub fn try_inline(cx: &DocContext, id: ast::NodeId, into: Option<ast::Name>)
     })
 }
 
-fn try_inline_def(cx: &DocContext, tcx: &ty::ctxt,
-                  def: def::Def) -> Option<Vec<clean::Item>> {
+fn try_inline_def(cx: &DocContext, tcx: &TyCtxt,
+                  def: Def) -> Option<Vec<clean::Item>> {
     let mut ret = Vec::new();
     let did = def.def_id();
     let inner = match def {
-        def::DefTrait(did) => {
+        Def::Trait(did) => {
             record_extern_fqn(cx, did, clean::TypeTrait);
             clean::TraitItem(build_external_trait(cx, tcx, did))
         }
-        def::DefFn(did, false) => {
-            // If this function is a tuple struct constructor, we just skip it
+        Def::Fn(did) => {
             record_extern_fqn(cx, did, clean::TypeFunction);
             clean::FunctionItem(build_external_function(cx, tcx, did))
         }
-        def::DefStruct(did) => {
+        Def::Struct(did)
+                // If this is a struct constructor, we skip it
+                if tcx.sess.cstore.tuple_struct_definition_if_ctor(did).is_none() => {
             record_extern_fqn(cx, did, clean::TypeStruct);
             ret.extend(build_impls(cx, tcx, did));
             clean::StructItem(build_struct(cx, tcx, did))
         }
-        def::DefTy(did, false) => {
+        Def::TyAlias(did) => {
             record_extern_fqn(cx, did, clean::TypeTypedef);
             ret.extend(build_impls(cx, tcx, did));
             build_type(cx, tcx, did)
         }
-        def::DefTy(did, true) => {
+        Def::Enum(did) => {
             record_extern_fqn(cx, did, clean::TypeEnum);
             ret.extend(build_impls(cx, tcx, did));
             build_type(cx, tcx, did)
         }
         // Assume that the enum type is reexported next to the variant, and
         // variants don't show up in documentation specially.
-        def::DefVariant(..) => return Some(Vec::new()),
-        def::DefMod(did) => {
+        Def::Variant(..) => return Some(Vec::new()),
+        Def::Mod(did) => {
             record_extern_fqn(cx, did, clean::TypeModule);
             clean::ModuleItem(build_module(cx, tcx, did))
         }
-        def::DefStatic(did, mtbl) => {
+        Def::Static(did, mtbl) => {
             record_extern_fqn(cx, did, clean::TypeStatic);
             clean::StaticItem(build_static(cx, tcx, did, mtbl))
         }
-        def::DefConst(did) | def::DefAssociatedConst(did) => {
+        Def::Const(did) | Def::AssociatedConst(did) => {
             record_extern_fqn(cx, did, clean::TypeConst);
             clean::ConstantItem(build_const(cx, tcx, did))
         }
@@ -120,13 +121,14 @@ fn try_inline_def(cx: &DocContext, tcx: &ty::ctxt,
         attrs: load_attrs(cx, tcx, did),
         inner: inner,
         visibility: Some(hir::Public),
-        stability: stability::lookup(tcx, did).clean(cx),
+        stability: stability::lookup_stability(tcx, did).clean(cx),
+        deprecation: stability::lookup_deprecation(tcx, did).clean(cx),
         def_id: did,
     });
     Some(ret)
 }
 
-pub fn load_attrs(cx: &DocContext, tcx: &ty::ctxt,
+pub fn load_attrs(cx: &DocContext, tcx: &TyCtxt,
                   did: DefId) -> Vec<clean::Attribute> {
     tcx.get_attrs(did).iter().map(|a| a.clean(cx)).collect()
 }
@@ -146,7 +148,7 @@ pub fn record_extern_fqn(cx: &DocContext, did: DefId, kind: clean::TypeKind) {
     }
 }
 
-pub fn build_external_trait(cx: &DocContext, tcx: &ty::ctxt,
+pub fn build_external_trait(cx: &DocContext, tcx: &TyCtxt,
                             did: DefId) -> clean::Trait {
     let def = tcx.lookup_trait_def(did);
     let trait_items = tcx.trait_items(did).clean(cx);
@@ -162,7 +164,7 @@ pub fn build_external_trait(cx: &DocContext, tcx: &ty::ctxt,
     }
 }
 
-fn build_external_function(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean::Function {
+fn build_external_function(cx: &DocContext, tcx: &TyCtxt, did: DefId) -> clean::Function {
     let t = tcx.lookup_item_type(did);
     let (decl, style, abi) = match t.ty.sty {
         ty::TyBareFn(_, ref f) => ((did, &f.sig).clean(cx), f.unsafety, f.abi),
@@ -185,9 +187,7 @@ fn build_external_function(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean
     }
 }
 
-fn build_struct(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean::Struct {
-    use syntax::parse::token::special_idents::unnamed_field;
-
+fn build_struct(cx: &DocContext, tcx: &TyCtxt, did: DefId) -> clean::Struct {
     let t = tcx.lookup_item_type(did);
     let predicates = tcx.lookup_predicates(did);
     let variant = tcx.lookup_adt_def(did).struct_variant();
@@ -195,8 +195,8 @@ fn build_struct(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean::Struct {
     clean::Struct {
         struct_type: match &*variant.fields {
             [] => doctree::Unit,
-            [ref f] if f.name == unnamed_field.name => doctree::Newtype,
-            [ref f, ..] if f.name == unnamed_field.name => doctree::Tuple,
+            [_] if variant.kind == ty::VariantKind::Tuple => doctree::Newtype,
+            [..] if variant.kind == ty::VariantKind::Tuple => doctree::Tuple,
             _ => doctree::Plain,
         },
         generics: (&t.generics, &predicates, subst::TypeSpace).clean(cx),
@@ -205,7 +205,7 @@ fn build_struct(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean::Struct {
     }
 }
 
-fn build_type(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean::ItemEnum {
+fn build_type(cx: &DocContext, tcx: &TyCtxt, did: DefId) -> clean::ItemEnum {
     let t = tcx.lookup_item_type(did);
     let predicates = tcx.lookup_predicates(did);
     match t.ty.sty {
@@ -225,7 +225,7 @@ fn build_type(cx: &DocContext, tcx: &ty::ctxt, did: DefId) -> clean::ItemEnum {
     }, false)
 }
 
-pub fn build_impls(cx: &DocContext, tcx: &ty::ctxt,
+pub fn build_impls(cx: &DocContext, tcx: &TyCtxt,
                    did: DefId) -> Vec<clean::Item> {
     tcx.populate_inherent_implementations_for_type_if_necessary(did);
     let mut impls = Vec::new();
@@ -252,12 +252,17 @@ pub fn build_impls(cx: &DocContext, tcx: &ty::ctxt,
             populate_impls(cx, tcx, item.def, &mut impls);
         }
 
-        fn populate_impls(cx: &DocContext, tcx: &ty::ctxt,
+        fn populate_impls(cx: &DocContext, tcx: &TyCtxt,
                           def: cstore::DefLike,
                           impls: &mut Vec<clean::Item>) {
             match def {
                 cstore::DlImpl(did) => build_impl(cx, tcx, did, impls),
-                cstore::DlDef(def::DefMod(did)) => {
+                cstore::DlDef(Def::Mod(did)) => {
+                    // Don't recurse if this is a #[doc(hidden)] module
+                    if load_attrs(cx, tcx, did).iter().any(|a| is_doc_hidden(a)) {
+                        return;
+                    }
+
                     for item in tcx.sess.cstore.item_children(did) {
                         populate_impls(cx, tcx, item.def, impls)
                     }
@@ -271,7 +276,7 @@ pub fn build_impls(cx: &DocContext, tcx: &ty::ctxt,
 }
 
 pub fn build_impl(cx: &DocContext,
-                  tcx: &ty::ctxt,
+                  tcx: &TyCtxt,
                   did: DefId,
                   ret: &mut Vec<clean::Item>) {
     if !cx.inlined.borrow_mut().as_mut().unwrap().insert(did) {
@@ -303,7 +308,8 @@ pub fn build_impl(cx: &DocContext,
             name: None,
             attrs: attrs,
             visibility: Some(hir::Inherited),
-            stability: stability::lookup(tcx, did).clean(cx),
+            stability: stability::lookup_stability(tcx, did).clean(cx),
+            deprecation: stability::lookup_deprecation(tcx, did).clean(cx),
             def_id: did,
         });
     }
@@ -319,7 +325,7 @@ pub fn build_impl(cx: &DocContext,
                 let did = assoc_const.def_id;
                 let type_scheme = tcx.lookup_item_type(did);
                 let default = if assoc_const.has_value {
-                    Some(const_eval::lookup_const_by_id(tcx, did, None)
+                    Some(const_eval::lookup_const_by_id(tcx, did, None, None)
                          .unwrap().span.to_src(cx))
                 } else {
                     None
@@ -333,7 +339,8 @@ pub fn build_impl(cx: &DocContext,
                     source: clean::Span::empty(),
                     attrs: vec![],
                     visibility: None,
-                    stability: stability::lookup(tcx, did).clean(cx),
+                    stability: stability::lookup_stability(tcx, did).clean(cx),
+                    deprecation: stability::lookup_deprecation(tcx, did).clean(cx),
                     def_id: did
                 })
             }
@@ -381,7 +388,8 @@ pub fn build_impl(cx: &DocContext,
                     source: clean::Span::empty(),
                     attrs: vec![],
                     visibility: None,
-                    stability: stability::lookup(tcx, did).clean(cx),
+                    stability: stability::lookup_stability(tcx, did).clean(cx),
+                    deprecation: stability::lookup_deprecation(tcx, did).clean(cx),
                     def_id: did
                 })
             }
@@ -414,26 +422,27 @@ pub fn build_impl(cx: &DocContext,
         name: None,
         attrs: attrs,
         visibility: Some(hir::Inherited),
-        stability: stability::lookup(tcx, did).clean(cx),
+        stability: stability::lookup_stability(tcx, did).clean(cx),
+        deprecation: stability::lookup_deprecation(tcx, did).clean(cx),
         def_id: did,
     });
+}
 
-    fn is_doc_hidden(a: &clean::Attribute) -> bool {
-        match *a {
-            clean::List(ref name, ref inner) if *name == "doc" => {
-                inner.iter().any(|a| {
-                    match *a {
-                        clean::Word(ref s) => *s == "hidden",
-                        _ => false,
-                    }
-                })
-            }
-            _ => false
+fn is_doc_hidden(a: &clean::Attribute) -> bool {
+    match *a {
+        clean::List(ref name, ref inner) if *name == "doc" => {
+            inner.iter().any(|a| {
+                match *a {
+                    clean::Word(ref s) => *s == "hidden",
+                    _ => false,
+                }
+            })
         }
+        _ => false
     }
 }
 
-fn build_module(cx: &DocContext, tcx: &ty::ctxt,
+fn build_module(cx: &DocContext, tcx: &TyCtxt,
                 did: DefId) -> clean::Module {
     let mut items = Vec::new();
     fill_in(cx, tcx, did, &mut items);
@@ -442,7 +451,7 @@ fn build_module(cx: &DocContext, tcx: &ty::ctxt,
         is_crate: false,
     };
 
-    fn fill_in(cx: &DocContext, tcx: &ty::ctxt, did: DefId,
+    fn fill_in(cx: &DocContext, tcx: &TyCtxt, did: DefId,
                items: &mut Vec<clean::Item>) {
         // If we're reexporting a reexport it may actually reexport something in
         // two namespaces, so the target may be listed twice. Make sure we only
@@ -450,11 +459,11 @@ fn build_module(cx: &DocContext, tcx: &ty::ctxt,
         let mut visited = HashSet::new();
         for item in tcx.sess.cstore.item_children(did) {
             match item.def {
-                cstore::DlDef(def::DefForeignMod(did)) => {
+                cstore::DlDef(Def::ForeignMod(did)) => {
                     fill_in(cx, tcx, did, items);
                 }
                 cstore::DlDef(def) if item.vis == hir::Public => {
-                    if !visited.insert(def) { return }
+                    if !visited.insert(def) { continue }
                     match try_inline_def(cx, tcx, def) {
                         Some(i) => items.extend(i),
                         None => {}
@@ -469,12 +478,12 @@ fn build_module(cx: &DocContext, tcx: &ty::ctxt,
     }
 }
 
-fn build_const(cx: &DocContext, tcx: &ty::ctxt,
+fn build_const(cx: &DocContext, tcx: &TyCtxt,
                did: DefId) -> clean::Constant {
     use rustc::middle::const_eval;
     use rustc_front::print::pprust;
 
-    let expr = const_eval::lookup_const_by_id(tcx, did, None).unwrap_or_else(|| {
+    let expr = const_eval::lookup_const_by_id(tcx, did, None, None).unwrap_or_else(|| {
         panic!("expected lookup_const_by_id to succeed for {:?}", did);
     });
     debug!("converting constant expr {:?} to snippet", expr);
@@ -487,7 +496,7 @@ fn build_const(cx: &DocContext, tcx: &ty::ctxt,
     }
 }
 
-fn build_static(cx: &DocContext, tcx: &ty::ctxt,
+fn build_static(cx: &DocContext, tcx: &TyCtxt,
                 did: DefId,
                 mutable: bool) -> clean::Static {
     clean::Static {

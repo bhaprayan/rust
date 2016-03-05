@@ -15,16 +15,16 @@ pub use self::ReprAttr::*;
 pub use self::IntType::*;
 
 use ast;
-use ast::{AttrId, Attribute, Attribute_, MetaItem, MetaWord, MetaNameValue, MetaList};
-use ast::{Stmt, StmtDecl, StmtExpr, StmtMac, StmtSemi, DeclItem, DeclLocal};
+use ast::{AttrId, Attribute, Attribute_, MetaItem, MetaItemKind};
+use ast::{Stmt, StmtKind, DeclKind};
 use ast::{Expr, Item, Local, Decl};
 use codemap::{Span, Spanned, spanned, dummy_spanned};
 use codemap::BytePos;
 use config::CfgDiag;
-use diagnostic::SpanHandler;
+use errors::Handler;
 use feature_gate::{GatedCfg, GatedCfgAttr};
 use parse::lexer::comments::{doc_comment_style, strip_doc_comment_decoration};
-use parse::token::{InternedString, intern_and_get_ident};
+use parse::token::InternedString;
 use parse::token;
 use ptr::P;
 
@@ -66,7 +66,7 @@ pub trait AttrMetaMethods {
     /// `#[foo="bar"]` and `#[foo(bar)]`
     fn name(&self) -> InternedString;
 
-    /// Gets the string value if self is a MetaNameValue variant
+    /// Gets the string value if self is a MetaItemKind::NameValue variant
     /// containing a string, otherwise None.
     fn value_str(&self) -> Option<InternedString>;
     /// Gets a list of inner meta items from a list MetaItem type.
@@ -96,17 +96,17 @@ impl AttrMetaMethods for Attribute {
 impl AttrMetaMethods for MetaItem {
     fn name(&self) -> InternedString {
         match self.node {
-            MetaWord(ref n) => (*n).clone(),
-            MetaNameValue(ref n, _) => (*n).clone(),
-            MetaList(ref n, _) => (*n).clone(),
+            MetaItemKind::Word(ref n) => (*n).clone(),
+            MetaItemKind::NameValue(ref n, _) => (*n).clone(),
+            MetaItemKind::List(ref n, _) => (*n).clone(),
         }
     }
 
     fn value_str(&self) -> Option<InternedString> {
         match self.node {
-            MetaNameValue(_, ref v) => {
+            MetaItemKind::NameValue(_, ref v) => {
                 match v.node {
-                    ast::LitStr(ref s, _) => Some((*s).clone()),
+                    ast::LitKind::Str(ref s, _) => Some((*s).clone()),
                     _ => None,
                 }
             },
@@ -116,7 +116,7 @@ impl AttrMetaMethods for MetaItem {
 
     fn meta_item_list(&self) -> Option<&[P<MetaItem>]> {
         match self.node {
-            MetaList(_, ref l) => Some(&l[..]),
+            MetaItemKind::List(_, ref l) => Some(&l[..]),
             _ => None
         }
     }
@@ -143,7 +143,7 @@ pub trait AttributeMethods {
 impl AttributeMethods for Attribute {
     /// Extract the MetaItem from inside this Attribute.
     fn meta(&self) -> &MetaItem {
-        &*self.node.value
+        &self.node.value
     }
 
     /// Convert self to a normal #[doc="foo"] comment, if it is a
@@ -173,21 +173,21 @@ impl AttributeMethods for Attribute {
 
 pub fn mk_name_value_item_str(name: InternedString, value: InternedString)
                               -> P<MetaItem> {
-    let value_lit = dummy_spanned(ast::LitStr(value, ast::CookedStr));
+    let value_lit = dummy_spanned(ast::LitKind::Str(value, ast::StrStyle::Cooked));
     mk_name_value_item(name, value_lit)
 }
 
 pub fn mk_name_value_item(name: InternedString, value: ast::Lit)
                           -> P<MetaItem> {
-    P(dummy_spanned(MetaNameValue(name, value)))
+    P(dummy_spanned(MetaItemKind::NameValue(name, value)))
 }
 
 pub fn mk_list_item(name: InternedString, items: Vec<P<MetaItem>>) -> P<MetaItem> {
-    P(dummy_spanned(MetaList(name, items)))
+    P(dummy_spanned(MetaItemKind::List(name, items)))
 }
 
 pub fn mk_word_item(name: InternedString) -> P<MetaItem> {
-    P(dummy_spanned(MetaWord(name)))
+    P(dummy_spanned(MetaItemKind::Word(name)))
 }
 
 thread_local! { static NEXT_ATTR_ID: Cell<usize> = Cell::new(0) }
@@ -225,12 +225,11 @@ pub fn mk_sugared_doc_attr(id: AttrId, text: InternedString, lo: BytePos,
                            hi: BytePos)
                            -> Attribute {
     let style = doc_comment_style(&text);
-    let lit = spanned(lo, hi, ast::LitStr(text, ast::CookedStr));
+    let lit = spanned(lo, hi, ast::LitKind::Str(text, ast::StrStyle::Cooked));
     let attr = Attribute_ {
         id: id,
         style: style,
-        value: P(spanned(lo, hi, MetaNameValue(InternedString::new("doc"),
-                                               lit))),
+        value: P(spanned(lo, hi, MetaItemKind::NameValue(InternedString::new("doc"), lit))),
         is_sugared_doc: true
     };
     spanned(lo, hi, attr)
@@ -286,7 +285,7 @@ pub fn sort_meta_items(items: Vec<P<MetaItem>>) -> Vec<P<MetaItem>> {
     v.into_iter().map(|(_, m)| m.map(|Spanned {node, span}| {
         Spanned {
             node: match node {
-                MetaList(n, mis) => MetaList(n, sort_meta_items(mis)),
+                MetaItemKind::List(n, mis) => MetaItemKind::List(n, sort_meta_items(mis)),
                 _ => node
             },
             span: span
@@ -299,20 +298,27 @@ pub fn find_crate_name(attrs: &[Attribute]) -> Option<InternedString> {
 }
 
 /// Find the value of #[export_name=*] attribute and check its validity.
-pub fn find_export_name_attr(diag: &SpanHandler, attrs: &[Attribute]) -> Option<InternedString> {
+pub fn find_export_name_attr(diag: &Handler, attrs: &[Attribute]) -> Option<InternedString> {
     attrs.iter().fold(None, |ia,attr| {
         if attr.check_name("export_name") {
             if let s@Some(_) = attr.value_str() {
                 s
             } else {
-                diag.span_err(attr.span, "export_name attribute has invalid format");
-                diag.handler.help("use #[export_name=\"*\"]");
+                diag.struct_span_err(attr.span,
+                                     "export_name attribute has invalid format")
+                    .help("use #[export_name=\"*\"]")
+                    .emit();
                 None
             }
         } else {
             ia
         }
     })
+}
+
+pub fn contains_extern_indicator(diag: &Handler, attrs: &[Attribute]) -> bool {
+    contains_name(attrs, "no_mangle") ||
+        find_export_name_attr(diag, attrs).is_some()
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -324,14 +330,14 @@ pub enum InlineAttr {
 }
 
 /// Determine what `#[inline]` attribute is present in `attrs`, if any.
-pub fn find_inline_attr(diagnostic: Option<&SpanHandler>, attrs: &[Attribute]) -> InlineAttr {
+pub fn find_inline_attr(diagnostic: Option<&Handler>, attrs: &[Attribute]) -> InlineAttr {
     attrs.iter().fold(InlineAttr::None, |ia,attr| {
         match attr.node.value.node {
-            MetaWord(ref n) if *n == "inline" => {
+            MetaItemKind::Word(ref n) if *n == "inline" => {
                 mark_used(attr);
                 InlineAttr::Hint
             }
-            MetaList(ref n, ref items) if *n == "inline" => {
+            MetaItemKind::List(ref n, ref items) if *n == "inline" => {
                 mark_used(attr);
                 if items.len() != 1 {
                     diagnostic.map(|d|{ d.span_err(attr.span, "expected one argument"); });
@@ -363,27 +369,27 @@ pub fn cfg_matches<T: CfgDiag>(cfgs: &[P<MetaItem>],
                            cfg: &ast::MetaItem,
                            diag: &mut T) -> bool {
     match cfg.node {
-        ast::MetaList(ref pred, ref mis) if &pred[..] == "any" =>
-            mis.iter().any(|mi| cfg_matches(cfgs, &**mi, diag)),
-        ast::MetaList(ref pred, ref mis) if &pred[..] == "all" =>
-            mis.iter().all(|mi| cfg_matches(cfgs, &**mi, diag)),
-        ast::MetaList(ref pred, ref mis) if &pred[..] == "not" => {
+        ast::MetaItemKind::List(ref pred, ref mis) if &pred[..] == "any" =>
+            mis.iter().any(|mi| cfg_matches(cfgs, &mi, diag)),
+        ast::MetaItemKind::List(ref pred, ref mis) if &pred[..] == "all" =>
+            mis.iter().all(|mi| cfg_matches(cfgs, &mi, diag)),
+        ast::MetaItemKind::List(ref pred, ref mis) if &pred[..] == "not" => {
             if mis.len() != 1 {
                 diag.emit_error(|diagnostic| {
                     diagnostic.span_err(cfg.span, "expected 1 cfg-pattern");
                 });
                 return false;
             }
-            !cfg_matches(cfgs, &*mis[0], diag)
+            !cfg_matches(cfgs, &mis[0], diag)
         }
-        ast::MetaList(ref pred, _) => {
+        ast::MetaItemKind::List(ref pred, _) => {
             diag.emit_error(|diagnostic| {
                 diagnostic.span_err(cfg.span,
                     &format!("invalid predicate `{}`", pred));
             });
             false
         },
-        ast::MetaWord(_) | ast::MetaNameValue(..) => {
+        ast::MetaItemKind::Word(_) | ast::MetaItemKind::NameValue(..) => {
             diag.flag_gated(|feature_gated_cfgs| {
                 feature_gated_cfgs.extend(
                     GatedCfg::gate(cfg).map(GatedCfgAttr::GatedCfg));
@@ -398,7 +404,7 @@ pub fn cfg_matches<T: CfgDiag>(cfgs: &[P<MetaItem>],
 pub struct Stability {
     pub level: StabilityLevel,
     pub feature: InternedString,
-    pub depr: Option<Deprecation>,
+    pub rustc_depr: Option<RustcDeprecation>,
 }
 
 /// The available stability levels.
@@ -410,9 +416,15 @@ pub enum StabilityLevel {
 }
 
 #[derive(RustcEncodable, RustcDecodable, PartialEq, PartialOrd, Clone, Debug, Eq, Hash)]
-pub struct Deprecation {
+pub struct RustcDeprecation {
     pub since: InternedString,
     pub reason: InternedString,
+}
+
+#[derive(RustcEncodable, RustcDecodable, PartialEq, PartialOrd, Clone, Debug, Eq, Hash)]
+pub struct Deprecation {
+    pub since: Option<InternedString>,
+    pub note: Option<InternedString>,
 }
 
 impl StabilityLevel {
@@ -420,14 +432,14 @@ impl StabilityLevel {
     pub fn is_stable(&self) -> bool { if let Stable {..} = *self { true } else { false }}
 }
 
-fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
+fn find_stability_generic<'a, I>(diagnostic: &Handler,
                                  attrs_iter: I,
                                  item_sp: Span)
                                  -> Option<Stability>
     where I: Iterator<Item = &'a Attribute>
 {
     let mut stab: Option<Stability> = None;
-    let mut depr: Option<Deprecation> = None;
+    let mut rustc_depr: Option<RustcDeprecation> = None;
 
     'outer: for attr in attrs_iter {
         let tag = attr.name();
@@ -456,7 +468,7 @@ fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
 
             match tag {
                 "rustc_deprecated" => {
-                    if depr.is_some() {
+                    if rustc_depr.is_some() {
                         diagnostic.span_err(item_sp, "multiple rustc_deprecated attributes");
                         break
                     }
@@ -477,7 +489,7 @@ fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
 
                     match (since, reason) {
                         (Some(since), Some(reason)) => {
-                            depr = Some(Deprecation {
+                            rustc_depr = Some(RustcDeprecation {
                                 since: since,
                                 reason: reason,
                             })
@@ -529,7 +541,7 @@ fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
                                     }
                                 },
                                 feature: feature,
-                                depr: None,
+                                rustc_depr: None,
                             })
                         }
                         (None, _, _) => {
@@ -569,7 +581,7 @@ fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
                                     since: since,
                                 },
                                 feature: feature,
-                                depr: None,
+                                rustc_depr: None,
                             })
                         }
                         (None, _) => {
@@ -591,12 +603,12 @@ fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
     }
 
     // Merge the deprecation info into the stability info
-    if let Some(depr) = depr {
+    if let Some(rustc_depr) = rustc_depr {
         if let Some(ref mut stab) = stab {
             if let Unstable {reason: ref mut reason @ None, ..} = stab.level {
-                *reason = Some(depr.reason.clone())
+                *reason = Some(rustc_depr.reason.clone())
             }
-            stab.depr = Some(depr);
+            stab.rustc_depr = Some(rustc_depr);
         } else {
             diagnostic.span_err(item_sp, "rustc_deprecated attribute must be paired with \
                                           either stable or unstable attribute");
@@ -606,13 +618,78 @@ fn find_stability_generic<'a, I>(diagnostic: &SpanHandler,
     stab
 }
 
+fn find_deprecation_generic<'a, I>(diagnostic: &Handler,
+                                   attrs_iter: I,
+                                   item_sp: Span)
+                                   -> Option<Deprecation>
+    where I: Iterator<Item = &'a Attribute>
+{
+    let mut depr: Option<Deprecation> = None;
+
+    'outer: for attr in attrs_iter {
+        if attr.name() != "deprecated" {
+            continue
+        }
+
+        mark_used(attr);
+
+        if depr.is_some() {
+            diagnostic.span_err(item_sp, "multiple deprecated attributes");
+            break
+        }
+
+        depr = if let Some(metas) = attr.meta_item_list() {
+            let get = |meta: &MetaItem, item: &mut Option<InternedString>| {
+                if item.is_some() {
+                    diagnostic.span_err(meta.span, &format!("multiple '{}' items",
+                                                             meta.name()));
+                    return false
+                }
+                if let Some(v) = meta.value_str() {
+                    *item = Some(v);
+                    true
+                } else {
+                    diagnostic.span_err(meta.span, "incorrect meta item");
+                    false
+                }
+            };
+
+            let mut since = None;
+            let mut note = None;
+            for meta in metas {
+                match &*meta.name() {
+                    "since" => if !get(meta, &mut since) { continue 'outer },
+                    "note" => if !get(meta, &mut note) { continue 'outer },
+                    _ => {
+                        diagnostic.span_err(meta.span, &format!("unknown meta item '{}'",
+                                                                meta.name()));
+                        continue 'outer
+                    }
+                }
+            }
+
+            Some(Deprecation {since: since, note: note})
+        } else {
+            Some(Deprecation{since: None, note: None})
+        }
+    }
+
+    depr
+}
+
 /// Find the first stability attribute. `None` if none exists.
-pub fn find_stability(diagnostic: &SpanHandler, attrs: &[Attribute],
+pub fn find_stability(diagnostic: &Handler, attrs: &[Attribute],
                       item_sp: Span) -> Option<Stability> {
     find_stability_generic(diagnostic, attrs.iter(), item_sp)
 }
 
-pub fn require_unique_names(diagnostic: &SpanHandler, metas: &[P<MetaItem>]) {
+/// Find the deprecation attribute. `None` if none exists.
+pub fn find_deprecation(diagnostic: &Handler, attrs: &[Attribute],
+                        item_sp: Span) -> Option<Deprecation> {
+    find_deprecation_generic(diagnostic, attrs.iter(), item_sp)
+}
+
+pub fn require_unique_names(diagnostic: &Handler, metas: &[P<MetaItem>]) {
     let mut set = HashSet::new();
     for meta in metas {
         let name = meta.name();
@@ -631,14 +708,14 @@ pub fn require_unique_names(diagnostic: &SpanHandler, metas: &[P<MetaItem>]) {
 /// `int_type_of_word`, below) to specify enum discriminant type; `C`, to use
 /// the same discriminant size that the corresponding C enum would or C
 /// structure layout, and `packed` to remove padding.
-pub fn find_repr_attrs(diagnostic: &SpanHandler, attr: &Attribute) -> Vec<ReprAttr> {
+pub fn find_repr_attrs(diagnostic: &Handler, attr: &Attribute) -> Vec<ReprAttr> {
     let mut acc = Vec::new();
     match attr.node.value.node {
-        ast::MetaList(ref s, ref items) if *s == "repr" => {
+        ast::MetaItemKind::List(ref s, ref items) if *s == "repr" => {
             mark_used(attr);
             for item in items {
                 match item.node {
-                    ast::MetaWord(ref word) => {
+                    ast::MetaItemKind::Word(ref word) => {
                         let hint = match &word[..] {
                             // Can't use "extern" because it's not a lexical identifier.
                             "C" => Some(ReprExtern),
@@ -673,16 +750,16 @@ pub fn find_repr_attrs(diagnostic: &SpanHandler, attr: &Attribute) -> Vec<ReprAt
 
 fn int_type_of_word(s: &str) -> Option<IntType> {
     match s {
-        "i8" => Some(SignedInt(ast::TyI8)),
-        "u8" => Some(UnsignedInt(ast::TyU8)),
-        "i16" => Some(SignedInt(ast::TyI16)),
-        "u16" => Some(UnsignedInt(ast::TyU16)),
-        "i32" => Some(SignedInt(ast::TyI32)),
-        "u32" => Some(UnsignedInt(ast::TyU32)),
-        "i64" => Some(SignedInt(ast::TyI64)),
-        "u64" => Some(UnsignedInt(ast::TyU64)),
-        "isize" => Some(SignedInt(ast::TyIs)),
-        "usize" => Some(UnsignedInt(ast::TyUs)),
+        "i8" => Some(SignedInt(ast::IntTy::I8)),
+        "u8" => Some(UnsignedInt(ast::UintTy::U8)),
+        "i16" => Some(SignedInt(ast::IntTy::I16)),
+        "u16" => Some(UnsignedInt(ast::UintTy::U16)),
+        "i32" => Some(SignedInt(ast::IntTy::I32)),
+        "u32" => Some(UnsignedInt(ast::UintTy::U32)),
+        "i64" => Some(SignedInt(ast::IntTy::I64)),
+        "u64" => Some(UnsignedInt(ast::UintTy::U64)),
+        "isize" => Some(SignedInt(ast::IntTy::Is)),
+        "usize" => Some(UnsignedInt(ast::UintTy::Us)),
         _ => None
     }
 }
@@ -724,11 +801,11 @@ impl IntType {
     }
     fn is_ffi_safe(self) -> bool {
         match self {
-            SignedInt(ast::TyI8) | UnsignedInt(ast::TyU8) |
-            SignedInt(ast::TyI16) | UnsignedInt(ast::TyU16) |
-            SignedInt(ast::TyI32) | UnsignedInt(ast::TyU32) |
-            SignedInt(ast::TyI64) | UnsignedInt(ast::TyU64) => true,
-            SignedInt(ast::TyIs) | UnsignedInt(ast::TyUs) => false
+            SignedInt(ast::IntTy::I8) | UnsignedInt(ast::UintTy::U8) |
+            SignedInt(ast::IntTy::I16) | UnsignedInt(ast::UintTy::U16) |
+            SignedInt(ast::IntTy::I32) | UnsignedInt(ast::UintTy::U32) |
+            SignedInt(ast::IntTy::I64) | UnsignedInt(ast::UintTy::U64) => true,
+            SignedInt(ast::IntTy::Is) | UnsignedInt(ast::UintTy::Us) => false
         }
     }
 }
@@ -860,8 +937,8 @@ impl WithAttrs for P<Decl> {
             Spanned {
                 span: span,
                 node: match node {
-                    DeclLocal(local) => DeclLocal(local.with_attrs(attrs)),
-                    DeclItem(item) => DeclItem(item.with_attrs(attrs)),
+                    DeclKind::Local(local) => DeclKind::Local(local.with_attrs(attrs)),
+                    DeclKind::Item(item) => DeclKind::Item(item.with_attrs(attrs)),
                 }
             }
         })
@@ -874,12 +951,12 @@ impl WithAttrs for P<Stmt> {
             Spanned {
                 span: span,
                 node: match node {
-                    StmtDecl(decl, id) => StmtDecl(decl.with_attrs(attrs), id),
-                    StmtExpr(expr, id) => StmtExpr(expr.with_attrs(attrs), id),
-                    StmtSemi(expr, id) => StmtSemi(expr.with_attrs(attrs), id),
-                    StmtMac(mac, style, mut ats) => {
+                    StmtKind::Decl(decl, id) => StmtKind::Decl(decl.with_attrs(attrs), id),
+                    StmtKind::Expr(expr, id) => StmtKind::Expr(expr.with_attrs(attrs), id),
+                    StmtKind::Semi(expr, id) => StmtKind::Semi(expr.with_attrs(attrs), id),
+                    StmtKind::Mac(mac, style, mut ats) => {
                         ats.update(|a| a.append(attrs));
-                        StmtMac(mac, style, ats)
+                        StmtKind::Mac(mac, style, ats)
                     }
                 },
             }

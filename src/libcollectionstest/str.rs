@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::borrow::Cow;
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::str::from_utf8;
 
@@ -270,6 +271,15 @@ fn test_replace_2d() {
 }
 
 #[test]
+fn test_replace_pattern() {
+    let data = "abcdαβγδabcdαβγδ";
+    assert_eq!(data.replace("dαβ", "😺😺😺"), "abc😺😺😺γδabc😺😺😺γδ");
+    assert_eq!(data.replace('γ', "😺😺😺"), "abcdαβ😺😺😺δabcdαβ😺😺😺δ");
+    assert_eq!(data.replace(&['a', 'γ'] as &[_], "😺😺😺"), "😺😺😺bcdαβ😺😺😺δ😺😺😺bcdαβ😺😺😺δ");
+    assert_eq!(data.replace(|c| c == 'γ', "😺😺😺"), "abcdαβ😺😺😺δabcdαβ😺😺😺δ");
+}
+
+#[test]
 fn test_slice() {
     assert_eq!("ab", &"abc"[0..2]);
     assert_eq!("bc", &"abc"[1..3]);
@@ -468,6 +478,18 @@ fn test_is_utf8() {
     assert!(from_utf8(&[0xEF, 0xBF, 0xBF]).is_ok());
     assert!(from_utf8(&[0xF0, 0x90, 0x80, 0x80]).is_ok());
     assert!(from_utf8(&[0xF4, 0x8F, 0xBF, 0xBF]).is_ok());
+}
+
+#[test]
+fn from_utf8_mostly_ascii() {
+    // deny invalid bytes embedded in long stretches of ascii
+    for i in 32..64 {
+        let mut data = [0; 128];
+        data[i] = 0xC0;
+        assert!(from_utf8(&data).is_err());
+        data[i] = 0xC2;
+        assert!(from_utf8(&data).is_err());
+    }
 }
 
 #[test]
@@ -1246,6 +1268,16 @@ fn test_box_slice_clone() {
     assert_eq!(data, data2);
 }
 
+#[test]
+fn test_cow_from() {
+    let borrowed = "borrowed";
+    let owned = String::from("owned");
+    match (Cow::from(owned.clone()), Cow::from(borrowed)) {
+        (Cow::Owned(o), Cow::Borrowed(b)) => assert!(o == owned && b == borrowed),
+        _ => panic!("invalid `Cow::from`"),
+    }
+}
+
 mod pattern {
     use std::str::pattern::Pattern;
     use std::str::pattern::{Searcher, ReverseSearcher};
@@ -1474,6 +1506,19 @@ generate_iterator_test! {
         ("foo::bar::baz", 2, "::") -> ["baz", "foo::bar"];
     }
     with str::rsplitn;
+}
+
+#[test]
+fn different_str_pattern_forwarding_lifetimes() {
+    use std::str::pattern::Pattern;
+
+    fn foo<'a, P>(p: P) where for<'b> &'b P: Pattern<'a> {
+        for _ in 0..3 {
+            "asdf".find(&p);
+        }
+    }
+
+    foo::<&str>("x");
 }
 
 mod bench {

@@ -8,18 +8,23 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use graphviz::IntoCow;
 use middle::const_eval::ConstVal;
 use middle::def_id::DefId;
 use middle::subst::Substs;
-use middle::ty::{AdtDef, ClosureSubsts, FnOutput, Region, Ty};
+use middle::ty::{self, AdtDef, ClosureSubsts, FnOutput, Region, Ty};
 use rustc_back::slice;
 use rustc_front::hir::InlineAsm;
-use syntax::ast::Name;
+use std::ascii;
+use std::borrow::{Cow};
+use std::fmt::{self, Debug, Formatter, Write};
+use std::{iter, u32};
+use std::ops::{Index, IndexMut};
+use syntax::ast::{self, Name};
 use syntax::codemap::Span;
-use std::fmt::{Debug, Formatter, Error};
-use std::u32;
 
 /// Lowered representation of a single function.
+#[derive(Clone, RustcEncodable, RustcDecodable)]
 pub struct Mir<'tcx> {
     /// List of basic blocks. References to basic block use a newtyped index type `BasicBlock`
     /// that indexes into this vector.
@@ -40,6 +45,9 @@ pub struct Mir<'tcx> {
     /// values in that it is possible to borrow them and mutate them
     /// through the resulting reference.
     pub temp_decls: Vec<TempDecl<'tcx>>,
+
+    /// A span representing this MIR, for error reporting
+    pub span: Span,
 }
 
 /// where execution begins
@@ -47,9 +55,6 @@ pub const START_BLOCK: BasicBlock = BasicBlock(0);
 
 /// where execution ends, on normal return
 pub const END_BLOCK: BasicBlock = BasicBlock(1);
-
-/// where execution ends, on panic
-pub const DIVERGE_BLOCK: BasicBlock = BasicBlock(2);
 
 impl<'tcx> Mir<'tcx> {
     pub fn all_basic_blocks(&self) -> Vec<BasicBlock> {
@@ -67,16 +72,32 @@ impl<'tcx> Mir<'tcx> {
     }
 }
 
+impl<'tcx> Index<BasicBlock> for Mir<'tcx> {
+    type Output = BasicBlockData<'tcx>;
+
+    #[inline]
+    fn index(&self, index: BasicBlock) -> &BasicBlockData<'tcx> {
+        self.basic_block_data(index)
+    }
+}
+
+impl<'tcx> IndexMut<BasicBlock> for Mir<'tcx> {
+    #[inline]
+    fn index_mut(&mut self, index: BasicBlock) -> &mut BasicBlockData<'tcx> {
+        self.basic_block_data_mut(index)
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////
 // Mutability and borrow kinds
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum Mutability {
     Mut,
     Not,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum BorrowKind {
     /// Data must be immutable and is aliasable.
     Shared,
@@ -125,31 +146,34 @@ pub enum BorrowKind {
 ///////////////////////////////////////////////////////////////////////////
 // Variables and temps
 
-// A "variable" is a binding declared by the user as part of the fn
-// decl, a let, etc.
+/// A "variable" is a binding declared by the user as part of the fn
+/// decl, a let, etc.
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub struct VarDecl<'tcx> {
     pub mutability: Mutability,
     pub name: Name,
     pub ty: Ty<'tcx>,
 }
 
-// A "temp" is a temporary that we place on the stack. They are
-// anonymous, always mutable, and have only a type.
+/// A "temp" is a temporary that we place on the stack. They are
+/// anonymous, always mutable, and have only a type.
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub struct TempDecl<'tcx> {
     pub ty: Ty<'tcx>,
 }
 
-// A "arg" is one of the function's formal arguments. These are
-// anonymous and distinct from the bindings that the user declares.
-//
-// For example, in this function:
-//
-// ```
-// fn foo((x, y): (i32, u32)) { ... }
-// ```
-//
-// there is only one argument, of type `(i32, u32)`, but two bindings
-// (`x` and `y`).
+/// A "arg" is one of the function's formal arguments. These are
+/// anonymous and distinct from the bindings that the user declares.
+///
+/// For example, in this function:
+///
+/// ```
+/// fn foo((x, y): (i32, u32)) { ... }
+/// ```
+///
+/// there is only one argument, of type `(i32, u32)`, but two bindings
+/// (`x` and `y`).
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub struct ArgDecl<'tcx> {
     pub ty: Ty<'tcx>,
 }
@@ -161,7 +185,7 @@ pub struct ArgDecl<'tcx> {
 /// list of the `Mir`.
 ///
 /// (We use a `u32` internally just to save memory.)
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub struct BasicBlock(u32);
 
 impl BasicBlock {
@@ -177,36 +201,32 @@ impl BasicBlock {
 }
 
 impl Debug for BasicBlock {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), Error> {
-        write!(fmt, "BB({})", self.0)
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        write!(fmt, "bb{}", self.0)
     }
 }
 
 ///////////////////////////////////////////////////////////////////////////
 // BasicBlock and Terminator
 
-#[derive(Debug)]
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub struct BasicBlockData<'tcx> {
     pub statements: Vec<Statement<'tcx>>,
-    pub terminator: Terminator<'tcx>,
+    pub terminator: Option<Terminator<'tcx>>,
+    pub is_cleanup: bool,
 }
 
+#[derive(Clone, RustcEncodable, RustcDecodable)]
 pub enum Terminator<'tcx> {
     /// block should have one successor in the graph; we jump there
     Goto {
         target: BasicBlock,
     },
 
-    /// block should initiate unwinding; should be one successor
-    /// that does cleanup and branches to DIVERGE_BLOCK
-    Panic {
-        target: BasicBlock,
-    },
-
     /// jump to branch 0 if this lvalue evaluates to true
     If {
         cond: Operand<'tcx>,
-        targets: [BasicBlock; 2],
+        targets: (BasicBlock, BasicBlock),
     },
 
     /// lvalue evaluates to some enum; jump depending on the branch
@@ -236,107 +256,185 @@ pub enum Terminator<'tcx> {
         targets: Vec<BasicBlock>,
     },
 
-    /// Indicates that the last statement in the block panics, aborts,
-    /// etc. No successors. This terminator appears on exactly one
-    /// basic block which we create in advance. However, during
-    /// construction, we use this value as a sentinel for "terminator
-    /// not yet assigned", and assert at the end that only the
-    /// well-known diverging block actually diverges.
-    Diverge,
+    /// Indicates that the landing pad is finished and unwinding should
+    /// continue. Emitted by build::scope::diverge_cleanup.
+    Resume,
 
     /// Indicates a normal return. The ReturnPointer lvalue should
     /// have been filled in by now. This should only occur in the
     /// `END_BLOCK`.
     Return,
 
-    /// block ends with a call; it should have two successors. The
-    /// first successor indicates normal return. The second indicates
-    /// unwinding.
+    /// Drop the Lvalue
+    Drop {
+        value: Lvalue<'tcx>,
+        target: BasicBlock,
+        unwind: Option<BasicBlock>
+    },
+
+    /// Block ends with a call of a converging function
     Call {
-        data: CallData<'tcx>,
-        targets: [BasicBlock; 2],
+        /// The function that’s being called
+        func: Operand<'tcx>,
+        /// Arguments the function is called with
+        args: Vec<Operand<'tcx>>,
+        /// Destination for the return value. If some, the call is converging.
+        destination: Option<(Lvalue<'tcx>, BasicBlock)>,
+        /// Cleanups to be done if the call unwinds.
+        cleanup: Option<BasicBlock>
     },
 }
 
 impl<'tcx> Terminator<'tcx> {
-    pub fn successors(&self) -> &[BasicBlock] {
+    pub fn successors(&self) -> Cow<[BasicBlock]> {
         use self::Terminator::*;
         match *self {
-            Goto { target: ref b } => slice::ref_slice(b),
-            Panic { target: ref b } => slice::ref_slice(b),
-            If { cond: _, targets: ref b } => b,
-            Switch { targets: ref b, .. } => b,
-            SwitchInt { targets: ref b, .. } => b,
-            Diverge => &[],
-            Return => &[],
-            Call { data: _, targets: ref b } => b,
+            Goto { target: ref b } => slice::ref_slice(b).into_cow(),
+            If { targets: (b1, b2), .. } => vec![b1, b2].into_cow(),
+            Switch { targets: ref b, .. } => b[..].into_cow(),
+            SwitchInt { targets: ref b, .. } => b[..].into_cow(),
+            Resume => (&[]).into_cow(),
+            Return => (&[]).into_cow(),
+            Call { destination: Some((_, t)), cleanup: Some(c), .. } => vec![t, c].into_cow(),
+            Call { destination: Some((_, ref t)), cleanup: None, .. } =>
+                slice::ref_slice(t).into_cow(),
+            Call { destination: None, cleanup: Some(ref c), .. } => slice::ref_slice(c).into_cow(),
+            Call { destination: None, cleanup: None, .. } => (&[]).into_cow(),
+            Drop { target, unwind: Some(unwind), .. } => vec![target, unwind].into_cow(),
+            Drop { ref target, .. } => slice::ref_slice(target).into_cow(),
         }
     }
 
-    pub fn successors_mut(&mut self) -> &mut [BasicBlock] {
+    // FIXME: no mootable cow. I’m honestly not sure what a “cow” between `&mut [BasicBlock]` and
+    // `Vec<&mut BasicBlock>` would look like in the first place.
+    pub fn successors_mut(&mut self) -> Vec<&mut BasicBlock> {
         use self::Terminator::*;
         match *self {
-            Goto { target: ref mut b } => slice::mut_ref_slice(b),
-            Panic { target: ref mut b } => slice::mut_ref_slice(b),
-            If { cond: _, targets: ref mut b } => b,
-            Switch { targets: ref mut b, .. } => b,
-            SwitchInt { targets: ref mut b, .. } => b,
-            Diverge => &mut [],
-            Return => &mut [],
-            Call { data: _, targets: ref mut b } => b,
+            Goto { target: ref mut b } => vec![b],
+            If { targets: (ref mut b1, ref mut b2), .. } => vec![b1, b2],
+            Switch { targets: ref mut b, .. } => b.iter_mut().collect(),
+            SwitchInt { targets: ref mut b, .. } => b.iter_mut().collect(),
+            Resume => Vec::new(),
+            Return => Vec::new(),
+            Call { destination: Some((_, ref mut t)), cleanup: Some(ref mut c), .. } => vec![t, c],
+            Call { destination: Some((_, ref mut t)), cleanup: None, .. } => vec![t],
+            Call { destination: None, cleanup: Some(ref mut c), .. } => vec![c],
+            Call { destination: None, cleanup: None, .. } => vec![],
+            Drop { ref mut target, unwind: Some(ref mut unwind), .. } => vec![target, unwind],
+            Drop { ref mut target, .. } => vec![target]
         }
     }
-}
-
-#[derive(Debug)]
-pub struct CallData<'tcx> {
-    /// where the return value is written to
-    pub destination: Lvalue<'tcx>,
-
-    /// the fn being called
-    pub func: Operand<'tcx>,
-
-    /// the arguments
-    pub args: Vec<Operand<'tcx>>,
 }
 
 impl<'tcx> BasicBlockData<'tcx> {
-    pub fn new(terminator: Terminator<'tcx>) -> BasicBlockData<'tcx> {
+    pub fn new(terminator: Option<Terminator<'tcx>>) -> BasicBlockData<'tcx> {
         BasicBlockData {
             statements: vec![],
             terminator: terminator,
+            is_cleanup: false,
         }
+    }
+
+    /// Accessor for terminator.
+    ///
+    /// Terminator may not be None after construction of the basic block is complete. This accessor
+    /// provides a convenience way to reach the terminator.
+    pub fn terminator(&self) -> &Terminator<'tcx> {
+        self.terminator.as_ref().expect("invalid terminator state")
+    }
+
+    pub fn terminator_mut(&mut self) -> &mut Terminator<'tcx> {
+        self.terminator.as_mut().expect("invalid terminator state")
     }
 }
 
 impl<'tcx> Debug for Terminator<'tcx> {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), Error> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        try!(self.fmt_head(fmt));
+        let successors = self.successors();
+        let labels = self.fmt_successor_labels();
+        assert_eq!(successors.len(), labels.len());
+
+        match successors.len() {
+            0 => Ok(()),
+
+            1 => write!(fmt, " -> {:?}", successors[0]),
+
+            _ => {
+                try!(write!(fmt, " -> ["));
+                for (i, target) in successors.iter().enumerate() {
+                    if i > 0 {
+                        try!(write!(fmt, ", "));
+                    }
+                    try!(write!(fmt, "{}: {:?}", labels[i], target));
+                }
+                write!(fmt, "]")
+            }
+
+        }
+    }
+}
+
+impl<'tcx> Terminator<'tcx> {
+    /// Write the "head" part of the terminator; that is, its name and the data it uses to pick the
+    /// successor basic block, if any. The only information not inlcuded is the list of possible
+    /// successors, which may be rendered differently between the text and the graphviz format.
+    pub fn fmt_head<W: Write>(&self, fmt: &mut W) -> fmt::Result {
         use self::Terminator::*;
         match *self {
-            Goto { target } =>
-                write!(fmt, "goto -> {:?}", target),
-            Panic { target } =>
-                write!(fmt, "panic -> {:?}", target),
-            If { cond: ref lv, ref targets } =>
-                write!(fmt, "if({:?}) -> {:?}", lv, targets),
-            Switch { discr: ref lv, adt_def: _, ref targets } =>
-                write!(fmt, "switch({:?}) -> {:?}", lv, targets),
-            SwitchInt { discr: ref lv, switch_ty: _, ref values, ref targets } =>
-                write!(fmt, "switchInt({:?}, {:?}) -> {:?}", lv, values, targets),
-            Diverge =>
-                write!(fmt, "diverge"),
-            Return =>
-                write!(fmt, "return"),
-            Call { data: ref c, targets } => {
-                try!(write!(fmt, "{:?} = {:?}(", c.destination, c.func));
-                for (index, arg) in c.args.iter().enumerate() {
+            Goto { .. } => write!(fmt, "goto"),
+            If { cond: ref lv, .. } => write!(fmt, "if({:?})", lv),
+            Switch { discr: ref lv, .. } => write!(fmt, "switch({:?})", lv),
+            SwitchInt { discr: ref lv, .. } => write!(fmt, "switchInt({:?})", lv),
+            Return => write!(fmt, "return"),
+            Resume => write!(fmt, "resume"),
+            Drop { ref value, .. } => write!(fmt, "drop({:?})", value),
+            Call { ref func, ref args, ref destination, .. } => {
+                if let Some((ref destination, _)) = *destination {
+                    try!(write!(fmt, "{:?} = ", destination));
+                }
+                try!(write!(fmt, "{:?}(", func));
+                for (index, arg) in args.iter().enumerate() {
                     if index > 0 {
                         try!(write!(fmt, ", "));
                     }
                     try!(write!(fmt, "{:?}", arg));
                 }
-                write!(fmt, ") -> {:?}", targets)
+                write!(fmt, ")")
             }
+        }
+    }
+
+    /// Return the list of labels for the edges to the successor basic blocks.
+    pub fn fmt_successor_labels(&self) -> Vec<Cow<'static, str>> {
+        use self::Terminator::*;
+        match *self {
+            Return | Resume => vec![],
+            Goto { .. } => vec!["".into()],
+            If { .. } => vec!["true".into(), "false".into()],
+            Switch { ref adt_def, .. } => {
+                adt_def.variants
+                       .iter()
+                       .map(|variant| variant.name.to_string().into())
+                       .collect()
+            }
+            SwitchInt { ref values, .. } => {
+                values.iter()
+                      .map(|const_val| {
+                          let mut buf = String::new();
+                          fmt_const_val(&mut buf, const_val).unwrap();
+                          buf.into()
+                      })
+                      .chain(iter::once(String::from("otherwise").into()))
+                      .collect()
+            }
+            Call { destination: Some(_), cleanup: Some(_), .. } =>
+                vec!["return".into_cow(), "unwind".into_cow()],
+            Call { destination: Some(_), cleanup: None, .. } => vec!["return".into_cow()],
+            Call { destination: None, cleanup: Some(_), .. } => vec!["unwind".into_cow()],
+            Call { destination: None, cleanup: None, .. } => vec![],
+            Drop { unwind: None, .. } => vec!["return".into_cow()],
+            Drop { .. } => vec!["return".into_cow(), "unwind".into_cow()],
         }
     }
 }
@@ -345,30 +443,22 @@ impl<'tcx> Debug for Terminator<'tcx> {
 ///////////////////////////////////////////////////////////////////////////
 // Statements
 
+#[derive(Clone, RustcEncodable, RustcDecodable)]
 pub struct Statement<'tcx> {
     pub span: Span,
     pub kind: StatementKind<'tcx>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub enum StatementKind<'tcx> {
     Assign(Lvalue<'tcx>, Rvalue<'tcx>),
-    Drop(DropKind, Lvalue<'tcx>),
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DropKind {
-    Free, // free a partially constructed box, should go away eventually
-    Deep
 }
 
 impl<'tcx> Debug for Statement<'tcx> {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), Error> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         use self::StatementKind::*;
         match self.kind {
-            Assign(ref lv, ref rv) => write!(fmt, "{:?} = {:?}", lv, rv),
-            Drop(DropKind::Free, ref lv) => write!(fmt, "free {:?}", lv),
-            Drop(DropKind::Deep, ref lv) => write!(fmt, "drop {:?}", lv),
+            Assign(ref lv, ref rv) => write!(fmt, "{:?} = {:?}", lv, rv)
         }
     }
 }
@@ -377,7 +467,7 @@ impl<'tcx> Debug for Statement<'tcx> {
 
 /// A path to a value; something that can be evaluated without
 /// changing or disturbing program state.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum Lvalue<'tcx> {
     /// local variable declared by the user
     Var(u32),
@@ -403,51 +493,52 @@ pub enum Lvalue<'tcx> {
 /// or `*B` or `B[index]`. Note that it is parameterized because it is
 /// shared between `Constant` and `Lvalue`. See the aliases
 /// `LvalueProjection` etc below.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
 pub struct Projection<'tcx, B, V> {
     pub base: B,
     pub elem: ProjectionElem<'tcx, V>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum ProjectionElem<'tcx, V> {
     Deref,
-    Field(Field),
+    Field(Field, Ty<'tcx>),
     Index(V),
 
-    // These indices are generated by slice patterns. Easiest to explain
-    // by example:
-    //
-    // ```
-    // [X, _, .._, _, _] => { offset: 0, min_length: 4, from_end: false },
-    // [_, X, .._, _, _] => { offset: 1, min_length: 4, from_end: false },
-    // [_, _, .._, X, _] => { offset: 2, min_length: 4, from_end: true },
-    // [_, _, .._, _, X] => { offset: 1, min_length: 4, from_end: true },
-    // ```
+    /// These indices are generated by slice patterns. Easiest to explain
+    /// by example:
+    ///
+    /// ```
+    /// [X, _, .._, _, _] => { offset: 0, min_length: 4, from_end: false },
+    /// [_, X, .._, _, _] => { offset: 1, min_length: 4, from_end: false },
+    /// [_, _, .._, X, _] => { offset: 2, min_length: 4, from_end: true },
+    /// [_, _, .._, _, X] => { offset: 1, min_length: 4, from_end: true },
+    /// ```
     ConstantIndex {
-        offset: u32,      // index or -index (in Python terms), depending on from_end
-        min_length: u32,  // thing being indexed must be at least this long
-        from_end: bool,   // counting backwards from end?
+        /// index or -index (in Python terms), depending on from_end
+        offset: u32,
+        /// thing being indexed must be at least this long
+        min_length: u32,
+        /// counting backwards from end?
+        from_end: bool,
     },
 
-    // "Downcast" to a variant of an ADT. Currently, we only introduce
-    // this for ADTs with more than one variant. It may be better to
-    // just introduce it always, or always for enums.
+    /// "Downcast" to a variant of an ADT. Currently, we only introduce
+    /// this for ADTs with more than one variant. It may be better to
+    /// just introduce it always, or always for enums.
     Downcast(AdtDef<'tcx>, usize),
 }
 
 /// Alias for projections as they appear in lvalues, where the base is an lvalue
 /// and the index is an operand.
-pub type LvalueProjection<'tcx> =
-    Projection<'tcx,Lvalue<'tcx>,Operand<'tcx>>;
+pub type LvalueProjection<'tcx> = Projection<'tcx, Lvalue<'tcx>, Operand<'tcx>>;
 
 /// Alias for projections as they appear in lvalues, where the base is an lvalue
 /// and the index is an operand.
-pub type LvalueElem<'tcx> =
-    ProjectionElem<'tcx,Operand<'tcx>>;
+pub type LvalueElem<'tcx> = ProjectionElem<'tcx, Operand<'tcx>>;
 
 /// Index into the list of fields found in a `VariantDef`
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
 pub struct Field(u32);
 
 impl Field {
@@ -462,8 +553,8 @@ impl Field {
 }
 
 impl<'tcx> Lvalue<'tcx> {
-    pub fn field(self, f: Field) -> Lvalue<'tcx> {
-        self.elem(ProjectionElem::Field(f))
+    pub fn field(self, f: Field, ty: Ty<'tcx>) -> Lvalue<'tcx> {
+        self.elem(ProjectionElem::Field(f, ty))
     }
 
     pub fn deref(self) -> Lvalue<'tcx> {
@@ -483,34 +574,34 @@ impl<'tcx> Lvalue<'tcx> {
 }
 
 impl<'tcx> Debug for Lvalue<'tcx> {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), Error> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         use self::Lvalue::*;
 
         match *self {
             Var(id) =>
-                write!(fmt,"Var({:?})", id),
+                write!(fmt, "var{:?}", id),
             Arg(id) =>
-                write!(fmt,"Arg({:?})", id),
+                write!(fmt, "arg{:?}", id),
             Temp(id) =>
-                write!(fmt,"Temp({:?})", id),
-            Static(id) =>
-                write!(fmt,"Static({:?})", id),
+                write!(fmt, "tmp{:?}", id),
+            Static(def_id) =>
+                write!(fmt, "{}", ty::tls::with(|tcx| tcx.item_path_str(def_id))),
             ReturnPointer =>
-                write!(fmt,"ReturnPointer"),
+                write!(fmt, "return"),
             Projection(ref data) =>
                 match data.elem {
-                    ProjectionElem::Downcast(_, variant_index) =>
-                        write!(fmt,"({:?} as {:?})", data.base, variant_index),
+                    ProjectionElem::Downcast(ref adt_def, index) =>
+                        write!(fmt, "({:?} as {})", data.base, adt_def.variants[index].name),
                     ProjectionElem::Deref =>
-                        write!(fmt,"(*{:?})", data.base),
-                    ProjectionElem::Field(field) =>
-                        write!(fmt,"{:?}.{:?}", data.base, field.index()),
+                        write!(fmt, "(*{:?})", data.base),
+                    ProjectionElem::Field(field, ty) =>
+                        write!(fmt, "({:?}.{:?}: {:?})", data.base, field.index(), ty),
                     ProjectionElem::Index(ref index) =>
-                        write!(fmt,"{:?}[{:?}]", data.base, index),
+                        write!(fmt, "{:?}[{:?}]", data.base, index),
                     ProjectionElem::ConstantIndex { offset, min_length, from_end: false } =>
-                        write!(fmt,"{:?}[{:?} of {:?}]", data.base, offset, min_length),
+                        write!(fmt, "{:?}[{:?} of {:?}]", data.base, offset, min_length),
                     ProjectionElem::ConstantIndex { offset, min_length, from_end: true } =>
-                        write!(fmt,"{:?}[-{:?} of {:?}]", data.base, offset, min_length),
+                        write!(fmt, "{:?}[-{:?} of {:?}]", data.base, offset, min_length),
                 },
         }
     }
@@ -519,18 +610,18 @@ impl<'tcx> Debug for Lvalue<'tcx> {
 ///////////////////////////////////////////////////////////////////////////
 // Operands
 //
-// These are values that can appear inside an rvalue (or an index
-// lvalue). They are intentionally limited to prevent rvalues from
-// being nested in one another.
+/// These are values that can appear inside an rvalue (or an index
+/// lvalue). They are intentionally limited to prevent rvalues from
+/// being nested in one another.
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum Operand<'tcx> {
     Consume(Lvalue<'tcx>),
     Constant(Constant<'tcx>),
 }
 
 impl<'tcx> Debug for Operand<'tcx> {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), Error> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         use self::Operand::*;
         match *self {
             Constant(ref a) => write!(fmt, "{:?}", a),
@@ -540,20 +631,20 @@ impl<'tcx> Debug for Operand<'tcx> {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Rvalues
+/// Rvalues
 
-#[derive(Clone)]
+#[derive(Clone, RustcEncodable, RustcDecodable)]
 pub enum Rvalue<'tcx> {
-    // x (either a move or copy, depending on type of x)
+    /// x (either a move or copy, depending on type of x)
     Use(Operand<'tcx>),
 
-    // [x; 32]
-    Repeat(Operand<'tcx>, Constant<'tcx>),
+    /// [x; 32]
+    Repeat(Operand<'tcx>, TypedConstVal<'tcx>),
 
-    // &x or &mut x
+    /// &x or &mut x
     Ref(Region, BorrowKind, Lvalue<'tcx>),
 
-    // length of a [X] or [X;n] value
+    /// length of a [X] or [X;n] value
     Len(Lvalue<'tcx>),
 
     Cast(CastKind, Operand<'tcx>, Ty<'tcx>),
@@ -562,31 +653,31 @@ pub enum Rvalue<'tcx> {
 
     UnaryOp(UnOp, Operand<'tcx>),
 
-    // Creates an *uninitialized* Box
+    /// Creates an *uninitialized* Box
     Box(Ty<'tcx>),
 
-    // Create an aggregate value, like a tuple or struct.  This is
-    // only needed because we want to distinguish `dest = Foo { x:
-    // ..., y: ... }` from `dest.x = ...; dest.y = ...;` in the case
-    // that `Foo` has a destructor. These rvalues can be optimized
-    // away after type-checking and before lowering.
+    /// Create an aggregate value, like a tuple or struct.  This is
+    /// only needed because we want to distinguish `dest = Foo { x:
+    /// ..., y: ... }` from `dest.x = ...; dest.y = ...;` in the case
+    /// that `Foo` has a destructor. These rvalues can be optimized
+    /// away after type-checking and before lowering.
     Aggregate(AggregateKind<'tcx>, Vec<Operand<'tcx>>),
 
-    // Generates a slice of the form `&input[from_start..L-from_end]`
-    // where `L` is the length of the slice. This is only created by
-    // slice pattern matching, so e.g. a pattern of the form `[x, y,
-    // .., z]` might create a slice with `from_start=2` and
-    // `from_end=1`.
+    /// Generates a slice of the form `&input[from_start..L-from_end]`
+    /// where `L` is the length of the slice. This is only created by
+    /// slice pattern matching, so e.g. a pattern of the form `[x, y,
+    /// .., z]` might create a slice with `from_start=2` and
+    /// `from_end=1`.
     Slice {
         input: Lvalue<'tcx>,
         from_start: usize,
         from_end: usize,
     },
 
-    InlineAsm(&'tcx InlineAsm),
+    InlineAsm(InlineAsm),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum CastKind {
     Misc,
 
@@ -604,7 +695,7 @@ pub enum CastKind {
     Unsize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum AggregateKind<'tcx> {
     Vec,
     Tuple,
@@ -612,7 +703,7 @@ pub enum AggregateKind<'tcx> {
     Closure(DefId, &'tcx ClosureSubsts<'tcx>),
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum BinOp {
     /// The `+` operator (addition)
     Add,
@@ -648,7 +739,7 @@ pub enum BinOp {
     Gt,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub enum UnOp {
     /// The `!` operator for logical inversion
     Not,
@@ -657,47 +748,186 @@ pub enum UnOp {
 }
 
 impl<'tcx> Debug for Rvalue<'tcx> {
-    fn fmt(&self, fmt: &mut Formatter) -> Result<(), Error> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         use self::Rvalue::*;
 
         match *self {
             Use(ref lvalue) => write!(fmt, "{:?}", lvalue),
             Repeat(ref a, ref b) => write!(fmt, "[{:?}; {:?}]", a, b),
-            Ref(ref a, bk, ref b) => write!(fmt, "&{:?} {:?} {:?}", a, bk, b),
-            Len(ref a) => write!(fmt, "LEN({:?})", a),
-            Cast(ref kind, ref lv, ref ty) => write!(fmt, "{:?} as {:?} ({:?}", lv, ty, kind),
-            BinaryOp(ref op, ref a, ref b) => write!(fmt, "{:?}({:?},{:?})", op, a, b),
+            Len(ref a) => write!(fmt, "Len({:?})", a),
+            Cast(ref kind, ref lv, ref ty) => write!(fmt, "{:?} as {:?} ({:?})", lv, ty, kind),
+            BinaryOp(ref op, ref a, ref b) => write!(fmt, "{:?}({:?}, {:?})", op, a, b),
             UnaryOp(ref op, ref a) => write!(fmt, "{:?}({:?})", op, a),
-            Box(ref t) => write!(fmt, "Box {:?}", t),
-            Aggregate(ref kind, ref lvs) => write!(fmt, "Aggregate<{:?}>({:?})", kind, lvs),
+            Box(ref t) => write!(fmt, "Box({:?})", t),
             InlineAsm(ref asm) => write!(fmt, "InlineAsm({:?})", asm),
             Slice { ref input, from_start, from_end } =>
                 write!(fmt, "{:?}[{:?}..-{:?}]", input, from_start, from_end),
+
+            Ref(_, borrow_kind, ref lv) => {
+                let kind_str = match borrow_kind {
+                    BorrowKind::Shared => "",
+                    BorrowKind::Mut | BorrowKind::Unique => "mut ",
+                };
+                write!(fmt, "&{}{:?}", kind_str, lv)
+            }
+
+            Aggregate(ref kind, ref lvs) => {
+                use self::AggregateKind::*;
+
+                fn fmt_tuple(fmt: &mut Formatter, name: &str, lvs: &[Operand]) -> fmt::Result {
+                    let mut tuple_fmt = fmt.debug_tuple(name);
+                    for lv in lvs {
+                        tuple_fmt.field(lv);
+                    }
+                    tuple_fmt.finish()
+                }
+
+                match *kind {
+                    Vec => write!(fmt, "{:?}", lvs),
+
+                    Tuple => {
+                        match lvs.len() {
+                            0 => write!(fmt, "()"),
+                            1 => write!(fmt, "({:?},)", lvs[0]),
+                            _ => fmt_tuple(fmt, "", lvs),
+                        }
+                    }
+
+                    Adt(adt_def, variant, _) => {
+                        let variant_def = &adt_def.variants[variant];
+                        let name = ty::tls::with(|tcx| tcx.item_path_str(variant_def.did));
+
+                        match variant_def.kind() {
+                            ty::VariantKind::Unit => write!(fmt, "{}", name),
+                            ty::VariantKind::Tuple => fmt_tuple(fmt, &name, lvs),
+                            ty::VariantKind::Struct => {
+                                let mut struct_fmt = fmt.debug_struct(&name);
+                                for (field, lv) in variant_def.fields.iter().zip(lvs) {
+                                    struct_fmt.field(&field.name.as_str(), lv);
+                                }
+                                struct_fmt.finish()
+                            }
+                        }
+                    }
+
+                    Closure(def_id, _) => ty::tls::with(|tcx| {
+                        if let Some(node_id) = tcx.map.as_local_node_id(def_id) {
+                            let name = format!("[closure@{:?}]", tcx.map.span(node_id));
+                            let mut struct_fmt = fmt.debug_struct(&name);
+
+                            tcx.with_freevars(node_id, |freevars| {
+                                for (freevar, lv) in freevars.iter().zip(lvs) {
+                                    let var_name = tcx.local_var_name_str(freevar.def.var_id());
+                                    struct_fmt.field(&var_name, lv);
+                                }
+                            });
+
+                            struct_fmt.finish()
+                        } else {
+                            write!(fmt, "[closure]")
+                        }
+                    }),
+                }
+            }
         }
     }
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Constants
-//
-// Two constants are equal if they are the same constant. Note that
-// this does not necessarily mean that they are "==" in Rust -- in
-// particular one must be wary of `NaN`!
+/// Constants
+///
+/// Two constants are equal if they are the same constant. Note that
+/// this does not necessarily mean that they are "==" in Rust -- in
+/// particular one must be wary of `NaN`!
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable)]
 pub struct Constant<'tcx> {
     pub span: Span,
     pub ty: Ty<'tcx>,
     pub literal: Literal<'tcx>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, RustcEncodable, RustcDecodable)]
+pub struct TypedConstVal<'tcx> {
+    pub ty: Ty<'tcx>,
+    pub span: Span,
+    pub value: ConstVal
+}
+
+impl<'tcx> Debug for TypedConstVal<'tcx> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        try!(write!(fmt, "const "));
+        fmt_const_val(fmt, &self.value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, RustcEncodable, RustcDecodable)]
+pub enum ItemKind {
+    Constant,
+    /// This is any sort of callable (usually those that have a type of `fn(…) -> …`). This
+    /// includes functions, constructors, but not methods which have their own ItemKind.
+    Function,
+    Method,
+}
+
+#[derive(Clone, PartialEq, RustcEncodable, RustcDecodable)]
 pub enum Literal<'tcx> {
     Item {
         def_id: DefId,
+        kind: ItemKind,
         substs: &'tcx Substs<'tcx>,
     },
     Value {
         value: ConstVal,
     },
+}
+
+impl<'tcx> Debug for Constant<'tcx> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        write!(fmt, "{:?}", self.literal)
+    }
+}
+
+impl<'tcx> Debug for Literal<'tcx> {
+    fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
+        use self::Literal::*;
+        match *self {
+            Item { def_id, .. } =>
+                write!(fmt, "{}", item_path_str(def_id)),
+            Value { ref value } => {
+                try!(write!(fmt, "const "));
+                fmt_const_val(fmt, value)
+            }
+        }
+    }
+}
+
+/// Write a `ConstVal` in a way closer to the original source code than the `Debug` output.
+fn fmt_const_val<W: Write>(fmt: &mut W, const_val: &ConstVal) -> fmt::Result {
+    use middle::const_eval::ConstVal::*;
+    match *const_val {
+        Float(f) => write!(fmt, "{:?}", f),
+        Int(n) => write!(fmt, "{:?}", n),
+        Uint(n) => write!(fmt, "{:?}", n),
+        Str(ref s) => write!(fmt, "{:?}", s),
+        ByteStr(ref bytes) => {
+            let escaped: String = bytes
+                .iter()
+                .flat_map(|&ch| ascii::escape_default(ch).map(|c| c as char))
+                .collect();
+            write!(fmt, "b\"{}\"", escaped)
+        }
+        Bool(b) => write!(fmt, "{:?}", b),
+        Function(def_id) => write!(fmt, "{}", item_path_str(def_id)),
+        Struct(node_id) | Tuple(node_id) | Array(node_id, _) | Repeat(node_id, _) =>
+            write!(fmt, "{}", node_to_string(node_id)),
+    }
+}
+
+fn node_to_string(node_id: ast::NodeId) -> String {
+    ty::tls::with(|tcx| tcx.map.node_to_user_string(node_id))
+}
+
+fn item_path_str(def_id: DefId) -> String {
+    ty::tls::with(|tcx| tcx.item_path_str(def_id))
 }

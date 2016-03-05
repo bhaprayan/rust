@@ -92,7 +92,7 @@ pub fn trans_slice_vec<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     // Handle the "..." case (returns a slice since strings are always unsized):
     if let hir::ExprLit(ref lit) = content_expr.node {
-        if let ast::LitStr(ref s, _) = lit.node {
+        if let ast::LitKind::Str(ref s, _) = lit.node {
             let scratch = rvalue_scratch_datum(bcx, vec_ty, "");
             bcx = trans_lit_str(bcx,
                                 content_expr,
@@ -111,8 +111,15 @@ pub fn trans_slice_vec<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     // Always create an alloca even if zero-sized, to preserve
     // the non-null invariant of the inner slice ptr
-    let llfixed = base::alloc_ty(bcx, fixed_ty, "");
-    call_lifetime_start(bcx, llfixed);
+    let llfixed;
+    // Issue 30018: ensure state is initialized as dropped if necessary.
+    if fcx.type_needs_drop(vt.unit_ty) {
+        llfixed = base::alloc_ty_init(bcx, fixed_ty, InitAlloca::Dropped, "");
+    } else {
+        let uninit = InitAlloca::Uninit("fcx says vt.unit_ty is non-drop");
+        llfixed = base::alloc_ty_init(bcx, fixed_ty, uninit, "");
+        call_lifetime_start(bcx, llfixed);
+    };
 
     if count > 0 {
         // Arrange for the backing array to be cleaned up.
@@ -173,7 +180,7 @@ fn write_content<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
     match content_expr.node {
         hir::ExprLit(ref lit) => {
             match lit.node {
-                ast::LitStr(ref s, _) => {
+                ast::LitKind::Str(ref s, _) => {
                     match dest {
                         Ignore => return bcx,
                         SaveIn(lldest) => {
@@ -199,7 +206,7 @@ fn write_content<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             match dest {
                 Ignore => {
                     for element in elements {
-                        bcx = expr::trans_into(bcx, &**element, Ignore);
+                        bcx = expr::trans_into(bcx, &element, Ignore);
                     }
                 }
 
@@ -209,11 +216,11 @@ fn write_content<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                         let lleltptr = GEPi(bcx, lldest, &[i]);
                         debug!("writing index {} with lleltptr={}",
                                i, bcx.val_to_string(lleltptr));
-                        bcx = expr::trans_into(bcx, &**element,
+                        bcx = expr::trans_into(bcx, &element,
                                                SaveIn(lleltptr));
                         let scope = cleanup::CustomScope(temp_scope);
-                        fcx.schedule_lifetime_end(scope, lleltptr);
-                        fcx.schedule_drop_mem(scope, lleltptr, vt.unit_ty, None);
+                        // Issue #30822: mark memory as dropped after running destructor
+                        fcx.schedule_drop_and_fill_mem(scope, lleltptr, vt.unit_ty, None);
                     }
                     fcx.pop_custom_cleanup_scope(temp_scope);
                 }
@@ -223,14 +230,14 @@ fn write_content<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
         hir::ExprRepeat(ref element, ref count_expr) => {
             match dest {
                 Ignore => {
-                    return expr::trans_into(bcx, &**element, Ignore);
+                    return expr::trans_into(bcx, &element, Ignore);
                 }
                 SaveIn(lldest) => {
-                    match bcx.tcx().eval_repeat_count(&**count_expr) {
-                        0 => expr::trans_into(bcx, &**element, Ignore),
-                        1 => expr::trans_into(bcx, &**element, SaveIn(lldest)),
+                    match bcx.tcx().eval_repeat_count(&count_expr) {
+                        0 => expr::trans_into(bcx, &element, Ignore),
+                        1 => expr::trans_into(bcx, &element, SaveIn(lldest)),
                         count => {
-                            let elem = unpack_datum!(bcx, expr::trans(bcx, &**element));
+                            let elem = unpack_datum!(bcx, expr::trans(bcx, &element));
                             let bcx = iter_vec_loop(bcx, lldest, vt,
                                                     C_uint(bcx.ccx(), count),
                                                     |set_bcx, lleltptr, _| {
@@ -269,7 +276,7 @@ fn elements_required(bcx: Block, content_expr: &hir::Expr) -> usize {
     match content_expr.node {
         hir::ExprLit(ref lit) => {
             match lit.node {
-                ast::LitStr(ref s, _) => s.len(),
+                ast::LitKind::Str(ref s, _) => s.len(),
                 _ => {
                     bcx.tcx().sess.span_bug(content_expr.span,
                                             "unexpected evec content")
@@ -278,7 +285,7 @@ fn elements_required(bcx: Block, content_expr: &hir::Expr) -> usize {
         },
         hir::ExprVec(ref es) => es.len(),
         hir::ExprRepeat(_, ref count_expr) => {
-            bcx.tcx().eval_repeat_count(&**count_expr)
+            bcx.tcx().eval_repeat_count(&count_expr)
         }
         _ => bcx.tcx().sess.span_bug(content_expr.span,
                                      "unexpected vec content")

@@ -28,29 +28,19 @@ impl<'tcx> CFG<'tcx> {
 
     pub fn start_new_block(&mut self) -> BasicBlock {
         let node_index = self.basic_blocks.len();
-        self.basic_blocks.push(BasicBlockData::new(Terminator::Diverge));
+        self.basic_blocks.push(BasicBlockData::new(None));
         BasicBlock::new(node_index)
+    }
+
+    pub fn start_new_cleanup_block(&mut self) -> BasicBlock {
+        let bb = self.start_new_block();
+        self.block_data_mut(bb).is_cleanup = true;
+        bb
     }
 
     pub fn push(&mut self, block: BasicBlock, statement: Statement<'tcx>) {
         debug!("push({:?}, {:?})", block, statement);
         self.block_data_mut(block).statements.push(statement);
-    }
-
-    pub fn push_assign_constant(&mut self,
-                                block: BasicBlock,
-                                span: Span,
-                                temp: &Lvalue<'tcx>,
-                                constant: Constant<'tcx>) {
-        self.push_assign(block, span, temp, Rvalue::Use(Operand::Constant(constant)));
-    }
-
-    pub fn push_drop(&mut self, block: BasicBlock, span: Span,
-                     kind: DropKind, lvalue: &Lvalue<'tcx>) {
-        self.push(block, Statement {
-            span: span,
-            kind: StatementKind::Drop(kind, lvalue.clone())
-        });
     }
 
     pub fn push_assign(&mut self,
@@ -64,18 +54,28 @@ impl<'tcx> CFG<'tcx> {
         });
     }
 
+    pub fn push_assign_constant(&mut self,
+                                block: BasicBlock,
+                                span: Span,
+                                temp: &Lvalue<'tcx>,
+                                constant: Constant<'tcx>) {
+        self.push_assign(block, span, temp, Rvalue::Use(Operand::Constant(constant)));
+    }
+
+    pub fn push_assign_unit(&mut self,
+                            block: BasicBlock,
+                            span: Span,
+                            lvalue: &Lvalue<'tcx>) {
+        self.push_assign(block, span, lvalue, Rvalue::Aggregate(
+            AggregateKind::Tuple, vec![]
+        ));
+    }
+
     pub fn terminate(&mut self,
                      block: BasicBlock,
                      terminator: Terminator<'tcx>) {
-        // Check whether this block has already been terminated. For
-        // this, we rely on the fact that the initial state is to have
-        // a Diverge terminator and an empty list of targets (which
-        // is not a valid state).
-        debug_assert!(match self.block_data(block).terminator { Terminator::Diverge => true,
-                                                                _ => false },
+        debug_assert!(self.block_data(block).terminator.is_none(),
                       "terminate: block {:?} already has a terminator set", block);
-
-        self.block_data_mut(block).terminator = terminator;
+        self.block_data_mut(block).terminator = Some(terminator);
     }
 }
-

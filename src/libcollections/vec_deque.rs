@@ -25,7 +25,6 @@ use core::mem;
 use core::ops::{Index, IndexMut};
 use core::ptr;
 use core::slice;
-use core::usize;
 
 use core::hash::{Hash, Hasher};
 use core::cmp;
@@ -36,7 +35,10 @@ use super::range::RangeArgument;
 
 const INITIAL_CAPACITY: usize = 7; // 2^3 - 1
 const MINIMUM_CAPACITY: usize = 1; // 2 - 1
-const MAXIMUM_ZST_CAPACITY: usize = 1 << (usize::BITS - 1); // Largest possible power of two
+#[cfg(target_pointer_width = "32")]
+const MAXIMUM_ZST_CAPACITY: usize = 1 << (32 - 1); // Largest possible power of two
+#[cfg(target_pointer_width = "64")]
+const MAXIMUM_ZST_CAPACITY: usize = 1 << (64 - 1); // Largest possible power of two
 
 /// `VecDeque` is a growable ring buffer, which can be used as a double-ended
 /// queue efficiently.
@@ -68,7 +70,12 @@ impl<T: Clone> Clone for VecDeque<T> {
 impl<T> Drop for VecDeque<T> {
     #[unsafe_destructor_blind_to_params]
     fn drop(&mut self) {
-        self.clear();
+        let (front, back) = self.as_mut_slices();
+        unsafe {
+            // use drop for [T]
+            ptr::drop_in_place(front);
+            ptr::drop_in_place(back);
+        }
         // RawVec handles deallocation
     }
 }
@@ -763,10 +770,12 @@ impl<T> VecDeque<T> {
     }
 
     /// Create a draining iterator that removes the specified range in the
-    /// `VecDeque` and yields the removed items from start to end. The element
-    /// range is removed even if the iterator is not consumed until the end.
+    /// `VecDeque` and yields the removed items.
     ///
-    /// Note: It is unspecified how many elements are removed from the deque,
+    /// Note 1: The element range is removed even if the iterator is not
+    /// consumed until the end.
+    ///
+    /// Note 2: It is unspecified how many elements are removed from the deque,
     /// if the `Drain` value is not dropped, but the borrow it holds expires
     /// (eg. due to mem::forget).
     ///
@@ -779,11 +788,13 @@ impl<T> VecDeque<T> {
     ///
     /// ```
     /// use std::collections::VecDeque;
+
+    /// let mut v: VecDeque<_> = vec![1, 2, 3].into_iter().collect();
+    /// assert_eq!(vec![3].into_iter().collect::<VecDeque<_>>(), v.drain(2..).collect());
+    /// assert_eq!(vec![1, 2].into_iter().collect::<VecDeque<_>>(), v);
     ///
-    /// // draining using `..` clears the whole deque.
-    /// let mut v = VecDeque::new();
-    /// v.push_back(1);
-    /// assert_eq!(v.drain(..).next(), Some(1));
+    /// // A full range clears all contents
+    /// v.drain(..);
     /// assert!(v.is_empty());
     /// ```
     #[inline]
@@ -1115,15 +1126,6 @@ impl<T> VecDeque<T> {
         self.pop_back()
     }
 
-    /// deprecated
-    #[unstable(feature = "deque_extras",
-               reason = "the naming of this function may be altered",
-               issue = "27788")]
-    #[rustc_deprecated(since = "1.5.0", reason = "renamed to swap_remove_back")]
-    pub fn swap_back_remove(&mut self, index: usize) -> Option<T> {
-        self.swap_remove_back(index)
-    }
-
     /// Removes an element from anywhere in the `VecDeque` and returns it,
     /// replacing it with the first element.
     ///
@@ -1156,15 +1158,6 @@ impl<T> VecDeque<T> {
             return None;
         }
         self.pop_front()
-    }
-
-    /// deprecated
-    #[unstable(feature = "deque_extras",
-               reason = "the naming of this function may be altered",
-               issue = "27788")]
-    #[rustc_deprecated(since = "1.5.0", reason = "renamed to swap_remove_front")]
-    pub fn swap_front_remove(&mut self, index: usize) -> Option<T> {
-        self.swap_remove_front(index)
     }
 
     /// Inserts an element at `index` within the `VecDeque`. Whichever
@@ -1980,7 +1973,39 @@ impl<'a, T: 'a> ExactSizeIterator for Drain<'a, T> {}
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<A: PartialEq> PartialEq for VecDeque<A> {
     fn eq(&self, other: &VecDeque<A>) -> bool {
-        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.eq(b))
+        if self.len() != other.len() {
+            return false;
+        }
+        let (sa, sb) = self.as_slices();
+        let (oa, ob) = other.as_slices();
+        if sa.len() == oa.len() {
+            sa == oa && sb == ob
+        } else if sa.len() < oa.len() {
+            // Always divisible in three sections, for example:
+            // self:  [a b c|d e f]
+            // other: [0 1 2 3|4 5]
+            // front = 3, mid = 1,
+            // [a b c] == [0 1 2] && [d] == [3] && [e f] == [4 5]
+            let front = sa.len();
+            let mid = oa.len() - front;
+
+            let (oa_front, oa_mid) = oa.split_at(front);
+            let (sb_mid, sb_back) = sb.split_at(mid);
+            debug_assert_eq!(sa.len(), oa_front.len());
+            debug_assert_eq!(sb_mid.len(), oa_mid.len());
+            debug_assert_eq!(sb_back.len(), ob.len());
+            sa == oa_front && sb_mid == oa_mid && sb_back == ob
+        } else {
+            let front = oa.len();
+            let mid = sa.len() - front;
+
+            let (sa_front, sa_mid) = sa.split_at(front);
+            let (ob_mid, ob_back) = ob.split_at(mid);
+            debug_assert_eq!(sa_front.len(), oa.len());
+            debug_assert_eq!(sa_mid.len(), ob_mid.len());
+            debug_assert_eq!(sb.len(), ob_back.len());
+            sa_front == oa && sa_mid == ob_mid && sb == ob_back
+        }
     }
 }
 
@@ -2006,9 +2031,9 @@ impl<A: Ord> Ord for VecDeque<A> {
 impl<A: Hash> Hash for VecDeque<A> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.len().hash(state);
-        for elt in self {
-            elt.hash(state);
-        }
+        let (a, b) = self.as_slices();
+        Hash::hash_slice(a, state);
+        Hash::hash_slice(b, state);
     }
 }
 
@@ -2178,7 +2203,7 @@ mod tests {
                             tester.push_front(i);
                         }
                         for i in 0..len {
-                            assert_eq!(tester.swap_back_remove(i), Some(len * 2 - 1 - i));
+                            assert_eq!(tester.swap_remove_back(i), Some(len * 2 - 1 - i));
                         }
                     } else {
                         for i in 0..len * 2 {
@@ -2186,7 +2211,7 @@ mod tests {
                         }
                         for i in 0..len {
                             let idx = tester.len() - 1 - i;
-                            assert_eq!(tester.swap_front_remove(idx), Some(len * 2 - 1 - i));
+                            assert_eq!(tester.swap_remove_front(idx), Some(len * 2 - 1 - i));
                         }
                     }
                     assert!(tester.tail < tester.cap());
@@ -2373,36 +2398,6 @@ mod tests {
                     assert_eq!(tester, expected_self);
                     assert_eq!(result, expected_other);
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn test_zst_push() {
-        const N: usize = 8;
-
-        // Zero sized type
-        struct Zst;
-
-        // Test that for all possible sequences of push_front / push_back,
-        // we end up with a deque of the correct size
-
-        for len in 0..N {
-            let mut tester = VecDeque::with_capacity(len);
-            assert_eq!(tester.len(), 0);
-            assert!(tester.capacity() >= len);
-            for case in 0..(1 << len) {
-                assert_eq!(tester.len(), 0);
-                for bit in 0..len {
-                    if case & (1 << bit) != 0 {
-                        tester.push_front(Zst);
-                    } else {
-                        tester.push_back(Zst);
-                    }
-                }
-                assert_eq!(tester.len(), len);
-                assert_eq!(tester.iter().count(), len);
-                tester.clear();
             }
         }
     }

@@ -10,12 +10,12 @@
 
 //! This module contains TypeVariants and its major components
 
+use middle::cstore;
 use middle::def_id::DefId;
 use middle::region;
 use middle::subst::{self, Substs};
 use middle::traits;
-use middle::ty::{self, AdtDef, TypeFlags, Ty, TyS};
-use middle::ty::{RegionEscape, ToPredicate};
+use middle::ty::{self, AdtDef, ToPredicate, TypeFlags, Ty, TyCtxt, TyS, TypeFoldable};
 use util::common::ErrorReported;
 
 use collections::enum_set::{self, EnumSet, CLike};
@@ -25,6 +25,8 @@ use std::mem;
 use syntax::abi;
 use syntax::ast::{self, Name};
 use syntax::parse::token::special_idents;
+
+use serialize::{Decodable, Decoder};
 
 use rustc_front::hir;
 
@@ -233,7 +235,7 @@ pub enum TypeVariants<'tcx> {
 /// closure C wind up influencing the decisions we ought to make for
 /// closure C (which would then require fixed point iteration to
 /// handle). Plus it fixes an ICE. :P
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub struct ClosureSubsts<'tcx> {
     /// Lifetime and type parameters from the enclosing function.
     /// These are separated out because trans wants to pass them around
@@ -244,6 +246,23 @@ pub struct ClosureSubsts<'tcx> {
     /// `upvar_borrows` lists. These are kept distinct so that we can
     /// easily index into them.
     pub upvar_tys: Vec<Ty<'tcx>>
+}
+
+impl<'tcx> Decodable for &'tcx ClosureSubsts<'tcx> {
+    fn decode<S: Decoder>(s: &mut S) -> Result<&'tcx ClosureSubsts<'tcx>, S::Error> {
+        let closure_substs = try! { Decodable::decode(s) };
+        let dummy_def_id: DefId = unsafe { mem::zeroed() };
+
+        cstore::tls::with_decoding_context(s, |dcx, _| {
+            // Intern the value
+            let ty = dcx.tcx().mk_closure_from_closure_substs(dummy_def_id,
+                                                              Box::new(closure_substs));
+            match ty.sty {
+                TyClosure(_, ref closure_substs) => Ok(&**closure_substs),
+                _ => unreachable!()
+            }
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -262,7 +281,7 @@ impl<'tcx> TraitTy<'tcx> {
     /// you must give *some* self-type. A common choice is `mk_err()`
     /// or some skolemized type.
     pub fn principal_trait_ref_with_self_ty(&self,
-                                            tcx: &ty::ctxt<'tcx>,
+                                            tcx: &TyCtxt<'tcx>,
                                             self_ty: Ty<'tcx>)
                                             -> ty::PolyTraitRef<'tcx>
     {
@@ -276,7 +295,7 @@ impl<'tcx> TraitTy<'tcx> {
     }
 
     pub fn projection_bounds_with_self_ty(&self,
-                                          tcx: &ty::ctxt<'tcx>,
+                                          tcx: &TyCtxt<'tcx>,
                                           self_ty: Ty<'tcx>)
                                           -> Vec<ty::PolyProjectionPredicate<'tcx>>
     {
@@ -434,7 +453,7 @@ pub struct ClosureTy<'tcx> {
     pub sig: PolyFnSig<'tcx>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
 pub enum FnOutput<'tcx> {
     FnConverging(Ty<'tcx>),
     FnDiverging
@@ -521,7 +540,7 @@ impl ParamTy {
         ParamTy::new(def.space, def.index, def.name)
     }
 
-    pub fn to_ty<'tcx>(self, tcx: &ty::ctxt<'tcx>) -> Ty<'tcx> {
+    pub fn to_ty<'tcx>(self, tcx: &TyCtxt<'tcx>) -> Ty<'tcx> {
         tcx.mk_param(self.space, self.idx, self.name)
     }
 
@@ -632,7 +651,7 @@ pub struct DebruijnIndex {
 ///
 /// [1] http://smallcultfollowing.com/babysteps/blog/2013/10/29/intermingled-parameter-lists/
 /// [2] http://smallcultfollowing.com/babysteps/blog/2013/11/04/intermingled-parameter-lists/
-#[derive(Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, Hash, Copy, RustcEncodable, RustcDecodable)]
 pub enum Region {
     // Region bound in a type or fn declaration which will be
     // substituted 'early' -- that is, at the same time when type
@@ -675,7 +694,6 @@ pub enum Region {
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable, Debug)]
 pub struct EarlyBoundRegion {
-    pub def_id: DefId,
     pub space: subst::ParamSpace,
     pub index: u32,
     pub name: Name,
@@ -701,7 +719,7 @@ pub struct RegionVid {
     pub index: u32
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
 pub struct SkolemizedRegionVid {
     pub index: u32
 }
@@ -757,7 +775,7 @@ impl BuiltinBounds {
     }
 
     pub fn to_predicates<'tcx>(&self,
-                               tcx: &ty::ctxt<'tcx>,
+                               tcx: &TyCtxt<'tcx>,
                                self_ty: Ty<'tcx>) -> Vec<ty::Predicate<'tcx>> {
         self.iter().filter_map(|builtin_bound|
             match traits::trait_ref_for_builtin_bound(tcx, builtin_bound, self_ty) {
@@ -804,7 +822,7 @@ impl CLike for BuiltinBound {
     }
 }
 
-impl<'tcx> ty::ctxt<'tcx> {
+impl<'tcx> TyCtxt<'tcx> {
     pub fn try_add_builtin_trait(&self,
                                  trait_def_id: DefId,
                                  builtin_bounds: &mut EnumSet<BuiltinBound>)
@@ -884,11 +902,18 @@ impl<'tcx> TyS<'tcx> {
         }
     }
 
-    pub fn is_empty(&self, _cx: &ty::ctxt) -> bool {
+    pub fn is_empty(&self, _cx: &TyCtxt) -> bool {
         // FIXME(#24885): be smarter here
         match self.sty {
             TyEnum(def, _) | TyStruct(def, _) => def.is_empty(),
             _ => false
+        }
+    }
+
+    pub fn is_primitive(&self) -> bool {
+        match self.sty {
+            TyBool | TyChar | TyInt(_) | TyUint(_) | TyFloat(_) => true,
+            _ => false,
         }
     }
 
@@ -949,16 +974,16 @@ impl<'tcx> TyS<'tcx> {
         }
     }
 
-    pub fn sequence_element_type(&self, cx: &ty::ctxt<'tcx>) -> Ty<'tcx> {
+    pub fn sequence_element_type(&self, cx: &TyCtxt<'tcx>) -> Ty<'tcx> {
         match self.sty {
             TyArray(ty, _) | TySlice(ty) => ty,
-            TyStr => cx.mk_mach_uint(ast::TyU8),
+            TyStr => cx.mk_mach_uint(ast::UintTy::U8),
             _ => cx.sess.bug(&format!("sequence_element_type called on non-sequence value: {}",
                                       self)),
         }
     }
 
-    pub fn simd_type(&self, cx: &ty::ctxt<'tcx>) -> Ty<'tcx> {
+    pub fn simd_type(&self, cx: &TyCtxt<'tcx>) -> Ty<'tcx> {
         match self.sty {
             TyStruct(def, substs) => {
                 def.struct_variant().fields[0].ty(cx, substs)
@@ -967,7 +992,7 @@ impl<'tcx> TyS<'tcx> {
         }
     }
 
-    pub fn simd_size(&self, _cx: &ty::ctxt) -> usize {
+    pub fn simd_size(&self, _cx: &TyCtxt) -> usize {
         match self.sty {
             TyStruct(def, _) => def.struct_variant().fields.len(),
             _ => panic!("simd_size called on invalid type")
@@ -1043,7 +1068,7 @@ impl<'tcx> TyS<'tcx> {
 
     pub fn is_uint(&self) -> bool {
         match self.sty {
-            TyInfer(IntVar(_)) | TyUint(ast::TyUs) => true,
+            TyInfer(IntVar(_)) | TyUint(ast::UintTy::Us) => true,
             _ => false
         }
     }
@@ -1089,7 +1114,7 @@ impl<'tcx> TyS<'tcx> {
 
     pub fn is_machine(&self) -> bool {
         match self.sty {
-            TyInt(ast::TyIs) | TyUint(ast::TyUs) => false,
+            TyInt(ast::IntTy::Is) | TyUint(ast::UintTy::Us) => false,
             TyInt(..) | TyUint(..) | TyFloat(..) => true,
             _ => false
         }

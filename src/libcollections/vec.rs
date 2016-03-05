@@ -8,8 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! A growable list type with heap-allocated contents, written `Vec<T>` but
-//! pronounced 'vector.'
+//! A contiguous growable array type with heap-allocated contents, written
+//! `Vec<T>` but pronounced 'vector.'
 //!
 //! Vectors have `O(1)` indexing, amortized `O(1)` push (to the end) and
 //! `O(1)` pop (from the end).
@@ -59,25 +59,27 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use alloc::raw_vec::RawVec;
 use alloc::boxed::Box;
 use alloc::heap::EMPTY;
+use alloc::raw_vec::RawVec;
+use borrow::ToOwned;
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{self, Hash};
-use core::intrinsics::{arith_offset, assume, needs_drop};
+use core::intrinsics::{arith_offset, assume};
 use core::iter::FromIterator;
 use core::mem;
-use core::ops::{Index, IndexMut, Deref};
+use core::ops::{Index, IndexMut};
 use core::ops;
 use core::ptr;
 use core::slice;
 
+#[allow(deprecated)]
 use borrow::{Cow, IntoCow};
 
 use super::range::RangeArgument;
 
-/// A growable list type, written `Vec<T>` but pronounced 'vector.'
+/// A contiguous growable array type, written `Vec<T>` but pronounced 'vector.'
 ///
 /// # Examples
 ///
@@ -132,6 +134,49 @@ use super::range::RangeArgument;
 ///     println!("{}", top);
 /// }
 /// ```
+///
+/// # Indexing
+///
+/// The Vec type allows to access values by index, because it implements the
+/// `Index` trait. An example will be more explicit:
+///
+/// ```
+/// let v = vec!(0, 2, 4, 6);
+/// println!("{}", v[1]); // it will display '2'
+/// ```
+///
+/// However be careful: if you try to access an index which isn't in the Vec,
+/// your software will panic! You cannot do this:
+///
+/// ```ignore
+/// let v = vec!(0, 2, 4, 6);
+/// println!("{}", v[6]); // it will panic!
+/// ```
+///
+/// In conclusion: always check if the index you want to get really exists
+/// before doing it.
+///
+/// # Slicing
+///
+/// A Vec can be mutable. Slices, on the other hand, are read-only objects.
+/// To get a slice, use "&". Example:
+///
+/// ```
+/// fn read_slice(slice: &[usize]) {
+///     // ...
+/// }
+///
+/// let v = vec!(0, 1);
+/// read_slice(&v);
+///
+/// // ... and that's all!
+/// // you can also do it like this:
+/// let x : &[usize] = &v;
+/// ```
+///
+/// In Rust, it's more common to pass slices as arguments rather than vectors
+/// when you just want to provide a read access. The same goes for String and
+/// &str.
 ///
 /// # Capacity and reallocation
 ///
@@ -452,10 +497,11 @@ impl<T> Vec<T> {
         unsafe {
             // drop any extra elements
             while len < self.len {
-                // decrement len before the read(), so a panic on Drop doesn't
-                // re-drop the just-failed value.
+                // decrement len before the drop_in_place(), so a panic on Drop
+                // doesn't re-drop the just-failed value.
                 self.len -= 1;
-                ptr::read(self.get_unchecked(self.len));
+                let len = self.len;
+                ptr::drop_in_place(self.get_unchecked_mut(len));
             }
         }
     }
@@ -464,9 +510,7 @@ impl<T> Vec<T> {
     ///
     /// Equivalent to `&s[..]`.
     #[inline]
-    #[unstable(feature = "convert",
-               reason = "waiting on RFC revision",
-               issue = "27729")]
+    #[stable(feature = "vec_as_slice", since = "1.7.0")]
     pub fn as_slice(&self) -> &[T] {
         self
     }
@@ -475,9 +519,7 @@ impl<T> Vec<T> {
     ///
     /// Equivalent to `&mut s[..]`.
     #[inline]
-    #[unstable(feature = "convert",
-               reason = "waiting on RFC revision",
-               issue = "27729")]
+    #[stable(feature = "vec_as_slice", since = "1.7.0")]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         &mut self[..]
     }
@@ -531,7 +573,7 @@ impl<T> Vec<T> {
     }
 
     /// Inserts an element at position `index` within the vector, shifting all
-    /// elements after position `i` one position to the right.
+    /// elements after it to the right.
     ///
     /// # Panics
     ///
@@ -573,7 +615,7 @@ impl<T> Vec<T> {
     }
 
     /// Removes and returns the element at position `index` within the vector,
-    /// shifting all elements after position `index` one position to the left.
+    /// shifting all elements after it to the left.
     ///
     /// # Panics
     ///
@@ -725,10 +767,12 @@ impl<T> Vec<T> {
     }
 
     /// Create a draining iterator that removes the specified range in the vector
-    /// and yields the removed items from start to end. The element range is
-    /// removed even if the iterator is not consumed until the end.
+    /// and yields the removed items.
     ///
-    /// Note: It is unspecified how many elements are removed from the vector,
+    /// Note 1: The element range is removed even if the iterator is not
+    /// consumed until the end.
+    ///
+    /// Note 2: It is unspecified how many elements are removed from the vector,
     /// if the `Drain` value is leaked.
     ///
     /// # Panics
@@ -739,11 +783,14 @@ impl<T> Vec<T> {
     /// # Examples
     ///
     /// ```
-    /// // Draining using `..` clears the whole vector.
     /// let mut v = vec![1, 2, 3];
-    /// let u: Vec<_> = v.drain(..).collect();
+    /// let u: Vec<_> = v.drain(1..).collect();
+    /// assert_eq!(v, &[1]);
+    /// assert_eq!(u, &[2, 3]);
+    ///
+    /// // A full range clears the vector
+    /// v.drain(..);
     /// assert_eq!(v, &[]);
-    /// assert_eq!(u, &[1, 2, 3]);
     /// ```
     #[stable(feature = "drain", since = "1.6.0")]
     pub fn drain<R>(&mut self, range: R) -> Drain<T>
@@ -920,21 +967,7 @@ impl<T: Clone> Vec<T> {
         }
     }
 
-    /// Appends all elements in a slice to the `Vec`.
-    ///
-    /// Iterates over the slice `other`, clones each element, and then appends
-    /// it to this `Vec`. The `other` vector is traversed in-order.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(vec_push_all)]
-    /// #![allow(deprecated)]
-    ///
-    /// let mut vec = vec![1];
-    /// vec.push_all(&[2, 3, 4]);
-    /// assert_eq!(vec, [1, 2, 3, 4]);
-    /// ```
+    #[allow(missing_docs)]
     #[inline]
     #[unstable(feature = "vec_push_all",
                reason = "likely to be replaced by a more optimized extend",
@@ -1439,13 +1472,8 @@ impl<T> Drop for Vec<T> {
     fn drop(&mut self) {
         if self.buf.unsafe_no_drop_flag_needs_drop() {
             unsafe {
-                // The branch on needs_drop() is an -O1 performance optimization.
-                // Without the branch, dropping Vec<u8> takes linear time.
-                if needs_drop::<T>() {
-                    for x in self.iter_mut() {
-                        ptr::drop_in_place(x);
-                    }
-                }
+                // use drop for [T]
+                ptr::drop_in_place(&mut self[..]);
             }
         }
         // RawVec handles deallocation
@@ -1517,6 +1545,20 @@ impl<'a> From<&'a str> for Vec<u8> {
 // Clone-on-write
 ////////////////////////////////////////////////////////////////////////////////
 
+#[stable(feature = "cow_from_vec", since = "1.7.0")]
+impl<'a, T: Clone> From<&'a [T]> for Cow<'a, [T]> {
+    fn from(s: &'a [T]) -> Cow<'a, [T]> {
+        Cow::Borrowed(s)
+    }
+}
+
+#[stable(feature = "cow_from_vec", since = "1.7.0")]
+impl<'a, T: Clone> From<Vec<T>> for Cow<'a, [T]> {
+    fn from(v: Vec<T>) -> Cow<'a, [T]> {
+        Cow::Owned(v)
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> FromIterator<T> for Cow<'a, [T]> where T: Clone {
     fn from_iter<I: IntoIterator<Item = T>>(it: I) -> Cow<'a, [T]> {
@@ -1525,6 +1567,7 @@ impl<'a, T> FromIterator<T> for Cow<'a, [T]> where T: Clone {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated)]
 impl<'a, T: 'a> IntoCow<'a, [T]> for Vec<T> where T: Clone {
     fn into_cow(self) -> Cow<'a, [T]> {
         Cow::Owned(self)
@@ -1532,6 +1575,7 @@ impl<'a, T: 'a> IntoCow<'a, [T]> for Vec<T> where T: Clone {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow(deprecated)]
 impl<'a, T> IntoCow<'a, [T]> for &'a [T] where T: Clone {
     fn into_cow(self) -> Cow<'a, [T]> {
         Cow::Borrowed(self)
@@ -1628,6 +1672,15 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> ExactSizeIterator for IntoIter<T> {}
+
+#[stable(feature = "vec_into_iter_clone", since = "1.8.0")]
+impl<T: Clone> Clone for IntoIter<T> {
+    fn clone(&self) -> IntoIter<T> {
+        unsafe {
+            slice::from_raw_parts(self.ptr, self.len()).to_owned().into_iter()
+        }
+    }
+}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> Drop for IntoIter<T> {

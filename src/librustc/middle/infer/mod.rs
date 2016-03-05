@@ -27,21 +27,20 @@ use middle::region::CodeExtent;
 use middle::subst;
 use middle::subst::Substs;
 use middle::subst::Subst;
-use middle::traits::{self, FulfillmentContext, Normalized,
-                     SelectionContext, ObligationCause};
+use middle::traits;
 use middle::ty::adjustment;
-use middle::ty::{TyVid, IntVid, FloatVid, RegionVid};
-use middle::ty::{self, Ty, HasTypeFlags};
+use middle::ty::{TyVid, IntVid, FloatVid};
+use middle::ty::{self, Ty, TyCtxt};
 use middle::ty::error::{ExpectedFound, TypeError, UnconstrainedNumeric};
 use middle::ty::fold::{TypeFolder, TypeFoldable};
 use middle::ty::relate::{Relate, RelateResult, TypeRelation};
 use rustc_data_structures::unify::{self, UnificationTable};
 use std::cell::{RefCell, Ref};
 use std::fmt;
-use std::rc::Rc;
 use syntax::ast;
 use syntax::codemap;
 use syntax::codemap::{Span, DUMMY_SP};
+use syntax::errors::DiagnosticBuilder;
 use util::nodemap::{FnvHashMap, FnvHashSet, NodeMap};
 
 use self::combine::CombineFields;
@@ -69,7 +68,7 @@ pub type UnitResult<'tcx> = RelateResult<'tcx, ()>; // "unify result"
 pub type FixupResult<T> = Result<T, FixupError>; // "fixup result"
 
 pub struct InferCtxt<'a, 'tcx: 'a> {
-    pub tcx: &'a ty::ctxt<'tcx>,
+    pub tcx: &'a TyCtxt<'tcx>,
 
     pub tables: &'a RefCell<ty::Tables<'tcx>>,
 
@@ -88,8 +87,6 @@ pub struct InferCtxt<'a, 'tcx: 'a> {
     region_vars: RegionVarBindings<'a, 'tcx>,
 
     pub parameter_environment: ty::ParameterEnvironment<'a, 'tcx>,
-
-    pub fulfillment_cx: RefCell<traits::FulfillmentContext<'tcx>>,
 
     // the set of predicates on which errors have been reported, to
     // avoid reporting the same error twice.
@@ -199,11 +196,6 @@ pub struct TypeTrace<'tcx> {
 /// See `error_reporting.rs` for more details
 #[derive(Clone, Debug)]
 pub enum SubregionOrigin<'tcx> {
-    // Marker to indicate a constraint that only arises due to new
-    // provisions from RFC 1214. This will result in a warning, not an
-    // error.
-    RFC1214Subregion(Rc<SubregionOrigin<'tcx>>),
-
     // Arose from a subtyping relation
     Subtype(TypeTrace<'tcx>),
 
@@ -360,16 +352,9 @@ pub fn fixup_err_to_string(f: FixupError) -> String {
     }
 }
 
-/// errors_will_be_reported is required to proxy to the fulfillment context
-/// FIXME -- a better option would be to hold back on modifying
-/// the global cache until we know that all dependent obligations
-/// are also satisfied. In that case, we could actually remove
-/// this boolean flag, and we'd also avoid the problem of squelching
-/// duplicate errors that occur across fns.
-pub fn new_infer_ctxt<'a, 'tcx>(tcx: &'a ty::ctxt<'tcx>,
+pub fn new_infer_ctxt<'a, 'tcx>(tcx: &'a TyCtxt<'tcx>,
                                 tables: &'a RefCell<ty::Tables<'tcx>>,
-                                param_env: Option<ty::ParameterEnvironment<'a, 'tcx>>,
-                                errors_will_be_reported: bool)
+                                param_env: Option<ty::ParameterEnvironment<'a, 'tcx>>)
                                 -> InferCtxt<'a, 'tcx> {
     InferCtxt {
         tcx: tcx,
@@ -379,17 +364,16 @@ pub fn new_infer_ctxt<'a, 'tcx>(tcx: &'a ty::ctxt<'tcx>,
         float_unification_table: RefCell::new(UnificationTable::new()),
         region_vars: RegionVarBindings::new(tcx),
         parameter_environment: param_env.unwrap_or(tcx.empty_parameter_environment()),
-        fulfillment_cx: RefCell::new(traits::FulfillmentContext::new(errors_will_be_reported)),
         reported_trait_errors: RefCell::new(FnvHashSet()),
         normalize: false,
         err_count_on_creation: tcx.sess.err_count()
     }
 }
 
-pub fn normalizing_infer_ctxt<'a, 'tcx>(tcx: &'a ty::ctxt<'tcx>,
+pub fn normalizing_infer_ctxt<'a, 'tcx>(tcx: &'a TyCtxt<'tcx>,
                                         tables: &'a RefCell<ty::Tables<'tcx>>)
                                         -> InferCtxt<'a, 'tcx> {
-    let mut infcx = new_infer_ctxt(tcx, tables, None, false);
+    let mut infcx = new_infer_ctxt(tcx, tables, None);
     infcx.normalize = true;
     infcx
 }
@@ -517,8 +501,8 @@ pub struct CombinedSnapshot {
     region_vars_snapshot: RegionSnapshot,
 }
 
-pub fn normalize_associated_type<'tcx,T>(tcx: &ty::ctxt<'tcx>, value: &T) -> T
-    where T : TypeFoldable<'tcx> + HasTypeFlags
+pub fn normalize_associated_type<'tcx,T>(tcx: &TyCtxt<'tcx>, value: &T) -> T
+    where T : TypeFoldable<'tcx>
 {
     debug!("normalize_associated_type(t={:?})", value);
 
@@ -528,7 +512,7 @@ pub fn normalize_associated_type<'tcx,T>(tcx: &ty::ctxt<'tcx>, value: &T) -> T
         return value;
     }
 
-    let infcx = new_infer_ctxt(tcx, &tcx.tables, None, true);
+    let infcx = new_infer_ctxt(tcx, &tcx.tables, None);
     let mut selcx = traits::SelectionContext::new(&infcx);
     let cause = traits::ObligationCause::dummy();
     let traits::Normalized { value: result, obligations } =
@@ -538,7 +522,7 @@ pub fn normalize_associated_type<'tcx,T>(tcx: &ty::ctxt<'tcx>, value: &T) -> T
            result,
            obligations);
 
-    let mut fulfill_cx = infcx.fulfillment_cx.borrow_mut();
+    let mut fulfill_cx = traits::FulfillmentContext::new();
 
     for obligation in obligations {
         fulfill_cx.register_predicate_obligation(&infcx, obligation);
@@ -552,7 +536,7 @@ pub fn drain_fulfillment_cx_or_panic<'a,'tcx,T>(span: Span,
                                                 fulfill_cx: &mut traits::FulfillmentContext<'tcx>,
                                                 result: &T)
                                                 -> T
-    where T : TypeFoldable<'tcx> + HasTypeFlags
+    where T : TypeFoldable<'tcx>
 {
     match drain_fulfillment_cx(infcx, fulfill_cx, result) {
         Ok(v) => v,
@@ -576,7 +560,7 @@ pub fn drain_fulfillment_cx<'a,'tcx,T>(infcx: &InferCtxt<'a,'tcx>,
                                        fulfill_cx: &mut traits::FulfillmentContext<'tcx>,
                                        result: &T)
                                        -> Result<T,Vec<traits::FulfillmentError<'tcx>>>
-    where T : TypeFoldable<'tcx> + HasTypeFlags
+    where T : TypeFoldable<'tcx>
 {
     debug!("drain_fulfillment_cx(result={:?})",
            result);
@@ -935,7 +919,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                          snapshot: &CombinedSnapshot,
                          value: &T)
                          -> T
-        where T : TypeFoldable<'tcx> + HasTypeFlags
+        where T : TypeFoldable<'tcx>
     {
         /*! See `higher_ranked::plug_leaks` */
 
@@ -1207,7 +1191,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
     }
 
     pub fn resolve_type_vars_if_possible<T>(&self, value: &T) -> T
-        where T: TypeFoldable<'tcx> + HasTypeFlags
+        where T: TypeFoldable<'tcx>
     {
         /*!
          * Where possible, replaces type/int/float variables in
@@ -1222,6 +1206,13 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             return value.clone(); // avoid duplicated subst-folding
         }
         let mut r = resolve::OpportunisticTypeResolver::new(self);
+        value.fold_with(&mut r)
+    }
+
+    pub fn resolve_type_and_region_vars_if_possible<T>(&self, value: &T) -> T
+        where T: TypeFoldable<'tcx>
+    {
+        let mut r = resolve::OpportunisticTypeAndRegionResolver::new(self);
         value.fold_with(&mut r)
     }
 
@@ -1269,10 +1260,21 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                                      sp: Span,
                                      mk_msg: M,
                                      actual_ty: String,
-                                     err: Option<&TypeError<'tcx>>) where
-        M: FnOnce(Option<String>, String) -> String,
+                                     err: Option<&TypeError<'tcx>>)
+        where M: FnOnce(Option<String>, String) -> String,
     {
         self.type_error_message_str_with_expected(sp, mk_msg, None, actual_ty, err)
+    }
+
+    pub fn type_error_struct_str<M>(&self,
+                                    sp: Span,
+                                    mk_msg: M,
+                                    actual_ty: String,
+                                    err: Option<&TypeError<'tcx>>)
+                                    -> DiagnosticBuilder<'tcx>
+        where M: FnOnce(Option<String>, String) -> String,
+    {
+        self.type_error_struct_str_with_expected(sp, mk_msg, None, actual_ty, err)
     }
 
     pub fn type_error_message_str_with_expected<M>(&self,
@@ -1280,8 +1282,21 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                                                    mk_msg: M,
                                                    expected_ty: Option<Ty<'tcx>>,
                                                    actual_ty: String,
-                                                   err: Option<&TypeError<'tcx>>) where
-        M: FnOnce(Option<String>, String) -> String,
+                                                   err: Option<&TypeError<'tcx>>)
+        where M: FnOnce(Option<String>, String) -> String,
+    {
+        self.type_error_struct_str_with_expected(sp, mk_msg, expected_ty, actual_ty, err)
+            .emit();
+    }
+
+    pub fn type_error_struct_str_with_expected<M>(&self,
+                                                  sp: Span,
+                                                  mk_msg: M,
+                                                  expected_ty: Option<Ty<'tcx>>,
+                                                  actual_ty: String,
+                                                  err: Option<&TypeError<'tcx>>)
+                                                  -> DiagnosticBuilder<'tcx>
+        where M: FnOnce(Option<String>, String) -> String,
     {
         debug!("hi! expected_ty = {:?}, actual_ty = {}", expected_ty, actual_ty);
 
@@ -1292,13 +1307,16 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                 format!(" ({})", t_err)
             });
 
-            self.tcx.sess.span_err(sp, &format!("{}{}",
+            let mut db = self.tcx.sess.struct_span_err(sp, &format!("{}{}",
                 mk_msg(resolved_expected.map(|t| self.ty_to_string(t)), actual_ty),
                 error_str));
 
             if let Some(err) = err {
-                self.tcx.note_and_explain_type_err(err, sp)
+                self.tcx.note_and_explain_type_err(&mut db, err, sp);
             }
+            db
+        } else {
+            self.tcx.sess.diagnostic().struct_dummy()
         }
     }
 
@@ -1306,19 +1324,30 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
                                  sp: Span,
                                  mk_msg: M,
                                  actual_ty: Ty<'tcx>,
-                                 err: Option<&TypeError<'tcx>>) where
-        M: FnOnce(String) -> String,
+                                 err: Option<&TypeError<'tcx>>)
+        where M: FnOnce(String) -> String,
+    {
+        self.type_error_struct(sp, mk_msg, actual_ty, err).emit();
+    }
+
+    pub fn type_error_struct<M>(&self,
+                                sp: Span,
+                                mk_msg: M,
+                                actual_ty: Ty<'tcx>,
+                                err: Option<&TypeError<'tcx>>)
+                                -> DiagnosticBuilder<'tcx>
+        where M: FnOnce(String) -> String,
     {
         let actual_ty = self.resolve_type_vars_if_possible(&actual_ty);
 
         // Don't report an error if actual type is TyError.
         if actual_ty.references_error() {
-            return;
+            return self.tcx.sess.diagnostic().struct_dummy();
         }
 
-        self.type_error_message_str(sp,
+        self.type_error_struct_str(sp,
             move |_e, a| { mk_msg(a) },
-            self.ty_to_string(actual_ty), err);
+            self.ty_to_string(actual_ty), err)
     }
 
     pub fn report_mismatched_types(&self,
@@ -1524,7 +1553,7 @@ impl<'tcx> TypeTrace<'tcx> {
         }
     }
 
-    pub fn dummy(tcx: &ty::ctxt<'tcx>) -> TypeTrace<'tcx> {
+    pub fn dummy(tcx: &TyCtxt<'tcx>) -> TypeTrace<'tcx> {
         TypeTrace {
             origin: TypeOrigin::Misc(codemap::DUMMY_SP),
             values: Types(ExpectedFound {
@@ -1562,7 +1591,6 @@ impl TypeOrigin {
 impl<'tcx> SubregionOrigin<'tcx> {
     pub fn span(&self) -> Span {
         match *self {
-            RFC1214Subregion(ref a) => a.span(),
             Subtype(ref a) => a.span(),
             InfStackClosure(a) => a,
             InvokeClosure(a) => a,

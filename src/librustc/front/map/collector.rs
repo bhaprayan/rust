@@ -79,6 +79,7 @@ impl<'ast> NodeCollector<'ast> {
 
     fn create_def(&mut self, node_id: NodeId, data: DefPathData) -> DefIndex {
         let parent_def = self.parent_def();
+        debug!("create_def(node_id={:?}, data={:?}, parent_def={:?})", node_id, data, parent_def);
         self.definitions.create_def_with_parent(parent_def, node_id, data)
     }
 
@@ -115,14 +116,17 @@ impl<'ast> Visitor<'ast> for NodeCollector<'ast> {
     /// deep walking so that we walk nested items in the context of
     /// their outer items.
     fn visit_nested_item(&mut self, item: ItemId) {
+        debug!("visit_nested_item: {:?}", item);
         self.visit_item(self.krate.item(item.id))
     }
 
     fn visit_item(&mut self, i: &'ast Item) {
+        debug!("visit_item: {:?}", i);
+
         // Pick the def data. This need not be unique, but the more
         // information we encapsulate into
         let def_data = match i.node {
-            ItemDefaultImpl(..) | ItemImpl(..) => DefPathData::Impl,
+            ItemDefaultImpl(..) | ItemImpl(..) => DefPathData::Impl(i.name),
             ItemEnum(..) | ItemStruct(..) | ItemTrait(..) => DefPathData::Type(i.name),
             ItemExternCrate(..) | ItemMod(..) => DefPathData::Mod(i.name),
             ItemStatic(..) | ItemConst(..) | ItemFn(..) => DefPathData::Value(i.name),
@@ -140,14 +144,14 @@ impl<'ast> Visitor<'ast> for NodeCollector<'ast> {
                 for v in &enum_definition.variants {
                     let variant_def_index =
                         self.insert_def(v.node.data.id(),
-                                        NodeVariant(&**v),
+                                        NodeVariant(v),
                                         DefPathData::EnumVariant(v.node.name));
 
                     for field in v.node.data.fields() {
                         self.create_def_with_parent(
                             Some(variant_def_index),
-                            field.node.id,
-                            DefPathData::Field(field.node.kind));
+                            field.id,
+                            DefPathData::Field(field.name));
                     }
                 }
             }
@@ -162,7 +166,7 @@ impl<'ast> Visitor<'ast> for NodeCollector<'ast> {
                 }
 
                 for field in struct_def.fields() {
-                    self.create_def(field.node.id, DefPathData::Field(field.node.kind));
+                    self.create_def(field.id, DefPathData::Field(field.name));
                 }
             }
             ItemTrait(_, _, ref bounds, _) => {
@@ -258,7 +262,7 @@ impl<'ast> Visitor<'ast> for NodeCollector<'ast> {
 
     fn visit_pat(&mut self, pat: &'ast Pat) {
         let maybe_binding = match pat.node {
-            PatIdent(_, id, _) => Some(id.node),
+            PatKind::Ident(_, id, _) => Some(id.node),
             _ => None
         };
 

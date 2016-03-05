@@ -13,9 +13,7 @@ use llvm::{self, ValueRef};
 use rustc::mir::repr as mir;
 use rustc::mir::tcx::LvalueTy;
 use trans::base;
-use trans::build;
-use trans::common::{self, Block};
-use trans::debuginfo::DebugLoc;
+use trans::common::{self, Block, BlockAndBuilder};
 use trans::expr;
 use trans::type_of;
 
@@ -28,6 +26,9 @@ use self::operand::OperandRef;
 pub struct MirContext<'bcx, 'tcx:'bcx> {
     mir: &'bcx mir::Mir<'tcx>,
 
+    /// Function context
+    fcx: &'bcx common::FunctionContext<'bcx, 'tcx>,
+
     /// When unwinding is initiated, we have to store this personality
     /// value somewhere so that we can load it and re-use it in the
     /// resume instruction. The personality is (afaik) some kind of
@@ -39,6 +40,9 @@ pub struct MirContext<'bcx, 'tcx:'bcx> {
 
     /// A `Block` for each MIR `BasicBlock`
     blocks: Vec<Block<'bcx, 'tcx>>,
+
+    /// Cached unreachable block
+    unreachable_block: Option<Block<'bcx, 'tcx>>,
 
     /// An LLVM alloca for each MIR `VarDecl`
     vars: Vec<LvalueRef<'tcx>>,
@@ -73,26 +77,28 @@ enum TempRef<'tcx> {
 
 ///////////////////////////////////////////////////////////////////////////
 
-pub fn trans_mir<'bcx, 'tcx>(bcx: Block<'bcx, 'tcx>) {
-    let fcx = bcx.fcx;
+pub fn trans_mir<'bcx, 'tcx>(bcx: BlockAndBuilder<'bcx, 'tcx>) {
+    let fcx = bcx.fcx();
     let mir = bcx.mir();
 
     let mir_blocks = bcx.mir().all_basic_blocks();
 
     // Analyze the temps to determine which must be lvalues
     // FIXME
-    let lvalue_temps = analyze::lvalue_temps(bcx, mir);
+    let lvalue_temps = bcx.with_block(|bcx| {
+      analyze::lvalue_temps(bcx, mir)
+    });
 
     // Allocate variable and temp allocas
     let vars = mir.var_decls.iter()
                             .map(|decl| (bcx.monomorphize(&decl.ty), decl.name))
-                            .map(|(mty, name)| LvalueRef::alloca(bcx, mty, &name.as_str()))
+                            .map(|(mty, name)| LvalueRef::alloca(&bcx, mty, &name.as_str()))
                             .collect();
     let temps = mir.temp_decls.iter()
                               .map(|decl| bcx.monomorphize(&decl.ty))
                               .enumerate()
-                              .map(|(i, mty)| if lvalue_temps.contains(&i) {
-                                  TempRef::Lvalue(LvalueRef::alloca(bcx,
+                              .map(|(i, mty)| if lvalue_temps.contains(i) {
+                                  TempRef::Lvalue(LvalueRef::alloca(&bcx,
                                                                     mty,
                                                                     &format!("temp{:?}", i)))
                               } else {
@@ -102,22 +108,27 @@ pub fn trans_mir<'bcx, 'tcx>(bcx: Block<'bcx, 'tcx>) {
                                   TempRef::Operand(None)
                               })
                               .collect();
-    let args = arg_value_refs(bcx, mir);
+    let args = arg_value_refs(&bcx, mir);
 
     // Allocate a `Block` for every basic block
     let block_bcxs: Vec<Block<'bcx,'tcx>> =
         mir_blocks.iter()
-                  .map(|&bb| fcx.new_block(false, &format!("{:?}", bb), None))
+                  .map(|&bb|{
+                      // FIXME(#30941) this doesn't handle msvc-style exceptions
+                      fcx.new_block(&format!("{:?}", bb), None)
+                  })
                   .collect();
 
     // Branch to the START block
     let start_bcx = block_bcxs[mir::START_BLOCK.index()];
-    build::Br(bcx, start_bcx.llbb, DebugLoc::None);
+    bcx.br(start_bcx.llbb);
 
     let mut mircx = MirContext {
         mir: mir,
+        fcx: fcx,
         llpersonalityslot: None,
         blocks: block_bcxs,
+        unreachable_block: None,
         vars: vars,
         temps: temps,
         args: args,
@@ -125,26 +136,18 @@ pub fn trans_mir<'bcx, 'tcx>(bcx: Block<'bcx, 'tcx>) {
 
     // Translate the body of each block
     for &bb in &mir_blocks {
-        if bb != mir::DIVERGE_BLOCK {
-            mircx.trans_block(bb);
-        }
+        mircx.trans_block(bb);
     }
-
-    // Total hack: translate DIVERGE_BLOCK last. This is so that any
-    // panics which the fn may do can initialize the
-    // `llpersonalityslot` cell. We don't do this up front because the
-    // LLVM type of it is (frankly) annoying to compute.
-    mircx.trans_block(mir::DIVERGE_BLOCK);
 }
 
 /// Produce, for each argument, a `ValueRef` pointing at the
 /// argument's value. As arguments are lvalues, these are always
 /// indirect.
-fn arg_value_refs<'bcx, 'tcx>(bcx: Block<'bcx, 'tcx>,
+fn arg_value_refs<'bcx, 'tcx>(bcx: &BlockAndBuilder<'bcx, 'tcx>,
                               mir: &mir::Mir<'tcx>)
                               -> Vec<LvalueRef<'tcx>> {
     // FIXME tupled_args? I think I'd rather that mapping is done in MIR land though
-    let fcx = bcx.fcx;
+    let fcx = bcx.fcx();
     let tcx = bcx.tcx();
     let mut idx = fcx.arg_offset() as c_uint;
     mir.arg_decls
@@ -167,18 +170,23 @@ fn arg_value_refs<'bcx, 'tcx>(bcx: Block<'bcx, 'tcx>,
                let lldata = llvm::get_param(fcx.llfn, idx);
                let llextra = llvm::get_param(fcx.llfn, idx + 1);
                idx += 2;
-               let lltemp = base::alloc_ty(bcx, arg_ty, &format!("arg{}", arg_index));
-               build::Store(bcx, lldata, expr::get_dataptr(bcx, lltemp));
-               build::Store(bcx, llextra, expr::get_meta(bcx, lltemp));
+               let (lltemp, dataptr, meta) = bcx.with_block(|bcx| {
+                   let lltemp = base::alloc_ty(bcx, arg_ty, &format!("arg{}", arg_index));
+                   (lltemp, expr::get_dataptr(bcx, lltemp), expr::get_meta(bcx, lltemp))
+               });
+               bcx.store(lldata, dataptr);
+               bcx.store(llextra, meta);
                lltemp
            } else {
                // otherwise, arg is passed by value, so make a
                // temporary and store it there
                let llarg = llvm::get_param(fcx.llfn, idx);
                idx += 1;
-               let lltemp = base::alloc_ty(bcx, arg_ty, &format!("arg{}", arg_index));
-               base::store_ty(bcx, llarg, lltemp, arg_ty);
-               lltemp
+               bcx.with_block(|bcx| {
+                   let lltemp = base::alloc_ty(bcx, arg_ty, &format!("arg{}", arg_index));
+                   base::store_ty(bcx, llarg, lltemp, arg_ty);
+                   lltemp
+               })
            };
            LvalueRef::new_sized(llval, LvalueTy::from_ty(arg_ty))
        })
@@ -188,7 +196,9 @@ fn arg_value_refs<'bcx, 'tcx>(bcx: Block<'bcx, 'tcx>,
 mod analyze;
 mod block;
 mod constant;
+mod did;
+mod drop;
 mod lvalue;
-mod rvalue;
 mod operand;
+mod rvalue;
 mod statement;

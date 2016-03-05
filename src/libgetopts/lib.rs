@@ -77,14 +77,10 @@
 //! }
 //! ```
 
-
-// Do not remove on snapshot creation. Needed for bootstrap. (Issue #22364)
-#![cfg_attr(stage0, feature(custom_attribute))]
 #![crate_name = "getopts"]
 #![unstable(feature = "rustc_private",
             reason = "use the crates.io `getopts` library instead",
             issue = "27812")]
-#![cfg_attr(stage0, staged_api)]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -335,9 +331,8 @@ impl Matches {
     /// Returns the string argument supplied to one of several matching options or `None`.
     pub fn opts_str(&self, names: &[String]) -> Option<String> {
         for nm in names {
-            match self.opt_val(&nm[..]) {
-                Some(Val(ref s)) => return Some(s.clone()),
-                _ => (),
+            if let Some(Val(ref s)) = self.opt_val(&nm[..]) {
+                  return Some(s.clone())
             }
         }
         None

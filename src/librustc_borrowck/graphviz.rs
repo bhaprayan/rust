@@ -23,7 +23,7 @@ use dot;
 use rustc::middle::cfg::CFGIndex;
 use rustc::middle::dataflow::{DataFlowOperator, DataFlowContext, EntryOrExit};
 use std::rc::Rc;
-use std::borrow::IntoCow;
+use dot::IntoCow;
 
 #[derive(Debug, Copy, Clone)]
 pub enum Variant {
@@ -87,7 +87,7 @@ impl<'a, 'tcx> DataflowLabeller<'a, 'tcx> {
             if saw_some {
                 set.push_str(", ");
             }
-            let loan_str = self.borrowck_ctxt.loan_path_to_string(&*lp);
+            let loan_str = self.borrowck_ctxt.loan_path_to_string(&lp);
             set.push_str(&loan_str[..]);
             saw_some = true;
             true

@@ -26,7 +26,6 @@ use super::{ObligationCauseCode, BuiltinDerivedObligation, ImplDerivedObligation
 use super::{SelectionError, Unimplemented, OutputTypeParameterMismatch};
 use super::{ObjectCastObligation, Obligation};
 use super::TraitNotObjectSafe;
-use super::RFC1214Warning;
 use super::Selection;
 use super::SelectionResult;
 use super::{VtableBuiltin, VtableImpl, VtableParam, VtableClosure,
@@ -40,15 +39,14 @@ use middle::def_id::DefId;
 use middle::infer;
 use middle::infer::{InferCtxt, TypeFreshener, TypeOrigin};
 use middle::subst::{Subst, Substs, TypeSpace};
-use middle::ty::{self, ToPredicate, RegionEscape, ToPolyTraitRef, Ty, HasTypeFlags};
+use middle::ty::{self, ToPredicate, ToPolyTraitRef, Ty, TyCtxt, TypeFoldable};
 use middle::ty::fast_reject;
-use middle::ty::fold::TypeFoldable;
 use middle::ty::relate::TypeRelation;
 
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
-use syntax::abi;
+use syntax::abi::Abi;
 use rustc_front::hir;
 use util::common::ErrorReported;
 use util::nodemap::FnvHashMap;
@@ -212,8 +210,6 @@ enum SelectionCandidate<'tcx> {
     BuiltinObjectCandidate,
 
     BuiltinUnsizeCandidate,
-
-    ErrorCandidate,
 }
 
 struct SelectionCandidateSet<'tcx> {
@@ -277,7 +273,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         self.infcx
     }
 
-    pub fn tcx(&self) -> &'cx ty::ctxt<'tcx> {
+    pub fn tcx(&self) -> &'cx TyCtxt<'tcx> {
         self.infcx.tcx
     }
 
@@ -310,6 +306,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                   -> SelectionResult<'tcx, Selection<'tcx>> {
         debug!("select({:?})", obligation);
         assert!(!obligation.predicate.has_escaping_regions());
+
+        let dep_node = obligation.predicate.dep_node();
+        let _task = self.tcx().dep_graph.in_task(dep_node);
 
         let stack = self.push_stack(TraitObligationStackList::empty(), obligation);
         match try!(self.candidate_from_obligation(&stack)) {
@@ -412,7 +411,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
     /// accurate if inference variables are involved.
     pub fn evaluate_obligation_conservatively(&mut self,
                                               obligation: &PredicateObligation<'tcx>)
-                               -> bool
+                                              -> bool
     {
         debug!("evaluate_obligation_conservatively({:?})",
                obligation);
@@ -463,8 +462,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // have been proven elsewhere. This cache only contains
         // predicates that are global in scope and hence unaffected by
         // the current environment.
-        let w = RFC1214Warning(false);
-        if self.tcx().fulfilled_predicates.borrow().is_duplicate(w, &obligation.predicate) {
+        if self.tcx().fulfilled_predicates.borrow().check_duplicate(&obligation.predicate) {
             return EvaluatedToOk;
         }
 
@@ -485,8 +483,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
             ty::Predicate::WellFormed(ty) => {
                 match ty::wf::obligations(self.infcx, obligation.cause.body_id,
-                                          ty, obligation.cause.span,
-                                          obligation.cause.code.is_rfc1214()) {
+                                          ty, obligation.cause.span) {
                     Some(obligations) =>
                         self.evaluate_predicates_recursively(previous_stack, obligations.iter()),
                     None =>
@@ -714,7 +711,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // not update) the cache.
         let recursion_limit = self.infcx.tcx.sess.recursion_limit.get();
         if stack.obligation.recursion_depth >= recursion_limit {
-            report_overflow_error(self.infcx(), &stack.obligation);
+            report_overflow_error(self.infcx(), &stack.obligation, true);
         }
 
         // Check the cache. Note that we skolemize the trait-ref
@@ -754,8 +751,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                                               stack: &TraitObligationStack<'o, 'tcx>)
                                               -> SelectionResult<'tcx, SelectionCandidate<'tcx>>
     {
-        if stack.obligation.predicate.0.self_ty().references_error() {
-            return Ok(Some(ErrorCandidate));
+        if stack.obligation.predicate.references_error() {
+            // If we encounter a `TyError`, we generally prefer the
+            // most "optimistic" result in response -- that is, the
+            // one least likely to report downstream errors. But
+            // because this routine is shared by coherence and by
+            // trait selection, there isn't an obvious "right" choice
+            // here in that respect, so we opt to just return
+            // ambiguity and let the upstream clients sort it out.
+            return Ok(None);
         }
 
         if !self.is_knowable(stack) {
@@ -965,7 +969,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         match *candidate {
             Ok(Some(_)) | Err(_) => true,
             Ok(None) => {
-                cache_fresh_trait_pred.0.input_types().has_infer_types()
+                cache_fresh_trait_pred.0.trait_ref.substs.types.has_infer_types()
             }
         }
     }
@@ -1284,7 +1288,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // provide an impl, but only for suitable `fn` pointers
             ty::TyBareFn(_, &ty::BareFnTy {
                 unsafety: hir::Unsafety::Normal,
-                abi: abi::Rust,
+                abi: Abi::Rust,
                 sig: ty::Binder(ty::FnSig {
                     inputs: _,
                     output: ty::FnConverging(_),
@@ -1588,7 +1592,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     true
                 },
                 &ParamCandidate(..) => false,
-                &ErrorCandidate => false // propagate errors
             },
             _ => false
         }
@@ -1999,10 +2002,6 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     try!(self.confirm_builtin_candidate(obligation, builtin_bound))))
             }
 
-            ErrorCandidate => {
-                Ok(VtableBuiltin(VtableBuiltinData { nested: vec![] }))
-            }
-
             ParamCandidate(param) => {
                 let obligations = self.confirm_param_candidate(obligation, param);
                 Ok(VtableParam(obligations))
@@ -2125,6 +2124,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                            nested: ty::Binder<Vec<Ty<'tcx>>>)
                            -> VtableBuiltinData<PredicateObligation<'tcx>>
     {
+        debug!("vtable_builtin_data(obligation={:?}, bound={:?}, nested={:?})",
+               obligation, bound, nested);
+
         let trait_def = match self.tcx().lang_items.from_builtin_kind(bound) {
             Ok(def_id) => def_id,
             Err(_) => {
@@ -2906,22 +2908,11 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // chain. Ideally, we should have a way to configure this either
         // by using -Z verbose or just a CLI argument.
         if obligation.recursion_depth >= 0 {
-            let derived_code = match obligation.cause.code {
-                ObligationCauseCode::RFC1214(ref base_code) => {
-                    let derived_cause = DerivedObligationCause {
-                        parent_trait_ref: obligation.predicate.to_poly_trait_ref(),
-                        parent_code: base_code.clone(),
-                    };
-                    ObligationCauseCode::RFC1214(Rc::new(variant(derived_cause)))
-                }
-                _ => {
-                    let derived_cause = DerivedObligationCause {
-                        parent_trait_ref: obligation.predicate.to_poly_trait_ref(),
-                        parent_code: Rc::new(obligation.cause.code.clone())
-                    };
-                    variant(derived_cause)
-                }
+            let derived_cause = DerivedObligationCause {
+                parent_trait_ref: obligation.predicate.to_poly_trait_ref(),
+                parent_code: Rc::new(obligation.cause.code.clone())
             };
+            let derived_code = variant(derived_cause);
             ObligationCause::new(obligation.cause.span, obligation.cause.body_id, derived_code)
         } else {
             obligation.cause.clone()

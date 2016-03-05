@@ -124,6 +124,7 @@ impl<'a> ArchiveBuilder<'a> {
         }
         let archive = self.src_archive.as_ref().unwrap().as_ref().unwrap();
         let ret = archive.iter()
+                         .filter_map(|child| child.ok())
                          .filter(is_relevant_child)
                          .filter_map(|child| child.name())
                          .filter(|name| !self.removals.iter().any(|x| x == name))
@@ -332,9 +333,15 @@ impl<'a> ArchiveBuilder<'a> {
         // We skip any files explicitly desired for skipping, and we also skip
         // all SYMDEF files as these are just magical placeholders which get
         // re-created when we make a new archive anyway.
-        for file in archive.iter().filter(is_relevant_child) {
+        for file in archive.iter() {
+            let file = try!(file.map_err(string_to_io_error));
+            if !is_relevant_child(&file) {
+                continue
+            }
             let filename = file.name().unwrap();
-            if skip(filename) { continue }
+            if skip(filename) {
+                continue
+            }
             let filename = Path::new(filename).file_name().unwrap()
                                               .to_str().unwrap();
 
@@ -406,11 +413,12 @@ impl<'a> ArchiveBuilder<'a> {
             Ok(prog) => {
                 let o = prog.wait_with_output().unwrap();
                 if !o.status.success() {
-                    sess.err(&format!("{:?} failed with: {}", cmd, o.status));
-                    sess.note(&format!("stdout ---\n{}",
-                                       str::from_utf8(&o.stdout).unwrap()));
-                    sess.note(&format!("stderr ---\n{}",
-                                       str::from_utf8(&o.stderr).unwrap()));
+                    sess.struct_err(&format!("{:?} failed with: {}", cmd, o.status))
+                        .note(&format!("stdout ---\n{}",
+                                       str::from_utf8(&o.stdout).unwrap()))
+                        .note(&format!("stderr ---\n{}",
+                                       str::from_utf8(&o.stderr).unwrap()))
+                        .emit();
                     sess.abort_if_errors();
                 }
                 o
@@ -447,6 +455,7 @@ impl<'a> ArchiveBuilder<'a> {
         unsafe {
             if let Some(archive) = self.src_archive() {
                 for child in archive.iter() {
+                    let child = try!(child.map_err(string_to_io_error));
                     let child_name = match child.name() {
                         Some(s) => s,
                         None => continue,
@@ -474,10 +483,25 @@ impl<'a> ArchiveBuilder<'a> {
                         strings.push(name);
                     }
                     Addition::Archive { archive, archive_name: _, mut skip } => {
-                        for child in archive.iter().filter(is_relevant_child) {
+                        for child in archive.iter() {
+                            let child = try!(child.map_err(string_to_io_error));
+                            if !is_relevant_child(&child) {
+                                continue
+                            }
                             let child_name = child.name().unwrap();
-                            if skip(child_name) { continue }
+                            if skip(child_name) {
+                                continue
+                            }
 
+                            // It appears that LLVM's archive writer is a little
+                            // buggy if the name we pass down isn't just the
+                            // filename component, so chop that off here and
+                            // pass it in.
+                            //
+                            // See LLVM bug 25877 for more info.
+                            let child_name = Path::new(child_name)
+                                                  .file_name().unwrap()
+                                                  .to_str().unwrap();
                             let name = try!(CString::new(child_name));
                             let m = llvm::LLVMRustArchiveMemberNew(ptr::null(),
                                                                    name.as_ptr(),
@@ -515,4 +539,8 @@ impl<'a> ArchiveBuilder<'a> {
             return ret
         }
     }
+}
+
+fn string_to_io_error(s: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("bad archive: {}", s))
 }

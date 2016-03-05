@@ -189,7 +189,7 @@
 //! ```
 //! let values = vec![1, 2, 3, 4, 5];
 //! {
-//!     let result = match values.into_iter() {
+//!     let result = match IntoIterator::into_iter(values) {
 //!         mut iter => loop {
 //!             match iter.next() {
 //!                 Some(x) => { println!("{}", x); },
@@ -321,7 +321,6 @@ fn _assert_is_object_safe(_: &Iterator<Item=()>) {}
 ///
 /// [module-level documentation]: index.html
 /// [impl]: index.html#implementing-iterator
-#[lang = "iterator"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented = "`{Self}` is not an iterator; maybe try calling \
                             `.iter()` or a similar method"]
@@ -604,7 +603,7 @@ pub trait Iterator {
     /// iterators, returning a tuple where the first element comes from the
     /// first iterator, and the second element comes from the second iterator.
     ///
-    /// In other words, it zips two iterators together, into a single one. 🤐
+    /// In other words, it zips two iterators together, into a single one.
     ///
     /// When either iterator returns `None`, all further calls to `next()`
     /// will return `None`.
@@ -1051,6 +1050,30 @@ pub trait Iterator {
     /// // got a false, take_while() isn't used any more
     /// assert_eq!(iter.next(), None);
     /// ```
+    ///
+    /// Because `take_while()` needs to look at the value in order to see if it
+    /// should be included or not, consuming iterators will see that it is
+    /// removed:
+    ///
+    /// ```
+    /// let a = [1, 2, 3, 4];
+    /// let mut iter = a.into_iter();
+    ///
+    /// let result: Vec<i32> = iter.by_ref()
+    ///                            .take_while(|n| **n != 3)
+    ///                            .cloned()
+    ///                            .collect();
+    ///
+    /// assert_eq!(result, &[1, 2]);
+    ///
+    /// let result: Vec<i32> = iter.cloned().collect();
+    ///
+    /// assert_eq!(result, &[4]);
+    /// ```
+    ///
+    /// The `3` is no longer there, because it was consumed in order to see if
+    /// the iteration should stop, but wasn't placed back into the iterator or
+    /// some similar thing.
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn take_while<P>(self, predicate: P) -> TakeWhile<Self, P> where
@@ -1113,16 +1136,22 @@ pub trait Iterator {
         Take{iter: self, n: n}
     }
 
-    /// An iterator similar to `fold()`, with internal state.
-    ///
-    /// `scan()` accumulates a final value, similar to [`fold()`], but instead
-    /// of passing along an accumulator, it maintains the accumulator internally.
+    /// An iterator adaptor similar to [`fold()`] that holds internal state and
+    /// produces a new iterator.
     ///
     /// [`fold()`]: #method.fold
     ///
-    /// On each iteraton of `scan()`, you can assign to the internal state, and
-    /// a mutable reference to the state is passed as the first argument to the
-    /// closure, allowing you to modify it on each iteration.
+    /// `scan()` takes two arguments: an initial value which seeds the internal
+    /// state, and a closure with two arguments, the first being a mutable
+    /// reference to the internal state and the second an iterator element.
+    /// The closure can assign to the internal state to share state between
+    /// iterations.
+    ///
+    /// On iteration, the closure will be applied to each element of the
+    /// iterator and the return value from the closure, an [`Option`], is
+    /// yielded by the iterator.
+    ///
+    /// [`Option`]: ../option/enum.Option.html
     ///
     /// # Examples
     ///
@@ -1353,7 +1382,7 @@ pub trait Iterator {
     /// One of the keys to `collect()`'s power is that many things you might
     /// not think of as 'collections' actually are. For example, a [`String`]
     /// is a collection of [`char`]s. And a collection of [`Result<T, E>`] can
-    /// be thought of as single [`Result<Collection<T>, E>`]. See the examples
+    /// be thought of as single `Result<Collection<T>, E>`. See the examples
     /// below for more.
     ///
     /// [`String`]: ../string/struct.String.html
@@ -1399,7 +1428,7 @@ pub trait Iterator {
     /// assert_eq!(6, doubled[2]);
     /// ```
     ///
-    /// Using the 'turbofish' instead of annotationg `doubled`:
+    /// Using the 'turbofish' instead of annotating `doubled`:
     ///
     /// ```
     /// let a = [1, 2, 3];
@@ -1581,7 +1610,7 @@ pub trait Iterator {
     /// `true`, then so does `all()`. If any of them return `false`, it
     /// returns `false`.
     ///
-    /// `all()` is short-circuting; in other words, it will stop processing
+    /// `all()` is short-circuiting; in other words, it will stop processing
     /// as soon as it finds a `false`, given that no matter what else happens,
     /// the result will also be `false`.
     ///
@@ -1631,7 +1660,7 @@ pub trait Iterator {
     /// `true`, then so does `any()`. If they all return `false`, it
     /// returns `false`.
     ///
-    /// `any()` is short-circuting; in other words, it will stop processing
+    /// `any()` is short-circuiting; in other words, it will stop processing
     /// as soon as it finds a `true`, given that no matter what else happens,
     /// the result will also be `true`.
     ///
@@ -1682,7 +1711,7 @@ pub trait Iterator {
     /// `true`, then `find()` returns `Some(element)`. If they all return
     /// `false`, it returns `None`.
     ///
-    /// `find()` is short-circuting; in other words, it will stop processing
+    /// `find()` is short-circuiting; in other words, it will stop processing
     /// as soon as the closure returns `true`.
     ///
     /// Because `find()` takes a reference, and many iterators iterate over
@@ -1733,7 +1762,7 @@ pub trait Iterator {
     /// returns `true`, then `position()` returns `Some(index)`. If all of
     /// them return `false`, it returns `None`.
     ///
-    /// `position()` is short-circuting; in other words, it will stop
+    /// `position()` is short-circuiting; in other words, it will stop
     /// processing as soon as it finds a `true`.
     ///
     /// # Overflow Behavior
@@ -1795,7 +1824,7 @@ pub trait Iterator {
     /// and if one of them returns `true`, then `rposition()` returns
     /// `Some(index)`. If all of them return `false`, it returns `None`.
     ///
-    /// `rposition()` is short-circuting; in other words, it will stop
+    /// `rposition()` is short-circuiting; in other words, it will stop
     /// processing as soon as it finds a `true`.
     ///
     /// # Examples
@@ -1893,21 +1922,7 @@ pub trait Iterator {
             .map(|(_, x)| x)
     }
 
-    /// Returns the element that gives the maximum value from the
-    /// specified function.
-    ///
-    /// Returns the rightmost element if the comparison determines two elements
-    /// to be equally maximum.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(iter_cmp)]
-    /// #![allow(deprecated)]
-    ///
-    /// let a = [-3_i32, 0, 1, 5, -10];
-    /// assert_eq!(*a.iter().max_by(|x| x.abs()).unwrap(), -10);
-    /// ```
+    #[allow(missing_docs)]
     #[inline]
     #[unstable(feature = "iter_cmp",
                reason = "may want to produce an Ordering directly; see #15311",
@@ -1945,22 +1960,8 @@ pub trait Iterator {
             .map(|(_, x)| x)
     }
 
-    /// Returns the element that gives the minimum value from the
-    /// specified function.
-    ///
-    /// Returns the latest element if the comparison determines two elements
-    /// to be equally minimum.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(iter_cmp)]
-    /// #![allow(deprecated)]
-    ///
-    /// let a = [-3_i32, 0, 1, 5, -10];
-    /// assert_eq!(*a.iter().min_by(|x| x.abs()).unwrap(), 0);
-    /// ```
     #[inline]
+    #[allow(missing_docs)]
     #[unstable(feature = "iter_cmp",
                reason = "may want to produce an Ordering directly; see #15311",
                issue = "27724")]
@@ -2078,7 +2079,7 @@ pub trait Iterator {
         (ts, us)
     }
 
-    /// Creates an iterator which clone()s all of its elements.
+    /// Creates an iterator which `clone()`s all of its elements.
     ///
     /// This is useful when you have an iterator over `&T`, but you need an
     /// iterator over `T`.
@@ -2154,7 +2155,7 @@ pub trait Iterator {
     /// ```
     #[unstable(feature = "iter_arith", reason = "bounds recently changed",
                issue = "27739")]
-    fn sum<S=<Self as Iterator>::Item>(self) -> S where
+    fn sum<S>(self) -> S where
         S: Add<Self::Item, Output=S> + Zero,
         Self: Sized,
     {
@@ -2179,7 +2180,7 @@ pub trait Iterator {
     /// ```
     #[unstable(feature="iter_arith", reason = "bounds recently changed",
                issue = "27739")]
-    fn product<P=<Self as Iterator>::Item>(self) -> P where
+    fn product<P>(self) -> P where
         P: Mul<Self::Item, Output=P> + One,
         Self: Sized,
     {
@@ -2763,7 +2764,13 @@ pub trait Extend<A> {
 /// It is important to note that both back and forth work on the same range,
 /// and do not cross: iteration is over when they meet in the middle.
 ///
+/// In a similar fashion to the [`Iterator`] protocol, once a
+/// `DoubleEndedIterator` returns `None` from a `next_back()`, calling it again
+/// may or may not ever return `Some` again. `next()` and `next_back()` are
+/// interchangable for this purpose.
+///
 /// [`Iterator`]: trait.Iterator.html
+///
 /// # Examples
 ///
 /// Basic usage:
@@ -2773,20 +2780,11 @@ pub trait Extend<A> {
 ///
 /// let mut iter = numbers.iter();
 ///
-/// let n = iter.next();
-/// assert_eq!(Some(&1), n);
-///
-/// let n = iter.next_back();
-/// assert_eq!(Some(&3), n);
-///
-/// let n = iter.next_back();
-/// assert_eq!(Some(&2), n);
-///
-/// let n = iter.next();
-/// assert_eq!(None, n);
-///
-/// let n = iter.next_back();
-/// assert_eq!(None, n);
+/// assert_eq!(Some(&1), iter.next());
+/// assert_eq!(Some(&3), iter.next_back());
+/// assert_eq!(Some(&2), iter.next_back());
+/// assert_eq!(None, iter.next());
+/// assert_eq!(None, iter.next_back());
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait DoubleEndedIterator: Iterator {
@@ -2806,20 +2804,11 @@ pub trait DoubleEndedIterator: Iterator {
     ///
     /// let mut iter = numbers.iter();
     ///
-    /// let n = iter.next();
-    /// assert_eq!(Some(&1), n);
-    ///
-    /// let n = iter.next_back();
-    /// assert_eq!(Some(&3), n);
-    ///
-    /// let n = iter.next_back();
-    /// assert_eq!(Some(&2), n);
-    ///
-    /// let n = iter.next();
-    /// assert_eq!(None, n);
-    ///
-    /// let n = iter.next_back();
-    /// assert_eq!(None, n);
+    /// assert_eq!(Some(&1), iter.next());
+    /// assert_eq!(Some(&3), iter.next_back());
+    /// assert_eq!(Some(&2), iter.next_back());
+    /// assert_eq!(None, iter.next());
+    /// assert_eq!(None, iter.next_back());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     fn next_back(&mut self) -> Option<Self::Item>;
@@ -3293,6 +3282,49 @@ impl<A, B> DoubleEndedIterator for Zip<A, B> where
 ///
 /// [`map()`]: trait.Iterator.html#method.map
 /// [`Iterator`]: trait.Iterator.html
+///
+/// # Notes about side effects
+///
+/// The [`map()`] iterator implements [`DoubleEndedIterator`], meaning that
+/// you can also [`map()`] backwards:
+///
+/// ```rust
+/// let v: Vec<i32> = vec![1, 2, 3].into_iter().rev().map(|x| x + 1).collect();
+///
+/// assert_eq!(v, [4, 3, 2]);
+/// ```
+///
+/// [`DoubleEndedIterator`]: trait.DoubleEndedIterator.html
+///
+/// But if your closure has state, iterating backwards may act in a way you do
+/// not expect. Let's go through an example. First, in the forward direction:
+///
+/// ```rust
+/// let mut c = 0;
+///
+/// for pair in vec!['a', 'b', 'c'].into_iter()
+///                                .map(|letter| { c += 1; (letter, c) }) {
+///     println!("{:?}", pair);
+/// }
+/// ```
+///
+/// This will print "('a', 1), ('b', 2), ('c', 3)".
+///
+/// Now consider this twist where we add a call to `rev`. This version will
+/// print `('c', 1), ('b', 2), ('a', 3)`. Note that the letters are reversed,
+/// but the values of the counter still go in order. This is because `map()` is
+/// still being called lazilly on each item, but we are popping items off the
+/// back of the vector now, instead of shifting them from the front.
+///
+/// ```rust
+/// let mut c = 0;
+///
+/// for pair in vec!['a', 'b', 'c'].into_iter()
+///                                .map(|letter| { c += 1; (letter, c) })
+///                                .rev() {
+///     println!("{:?}", pair);
+/// }
+/// ```
 #[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(Clone)]
@@ -4269,13 +4301,15 @@ impl<A: Step> RangeFrom<A> {
     ///
     /// # Examples
     ///
-    /// ```ignore
-    /// for i in (0u8..).step_by(2) {
+    /// ```
+    /// # #![feature(step_by)]
+    ///
+    /// for i in (0u8..).step_by(2).take(10) {
     ///     println!("{}", i);
     /// }
     /// ```
     ///
-    /// This prints all even `u8` values.
+    /// This prints the first ten even natural integers (0 to 18).
     #[unstable(feature = "step_by", reason = "recent addition",
                issue = "27741")]
     pub fn step_by(self, by: A) -> StepBy<A, Self> {
@@ -4777,88 +4811,4 @@ impl<T> ExactSizeIterator for Once<T> {
 #[stable(feature = "iter_once", since = "1.2.0")]
 pub fn once<T>(value: T) -> Once<T> {
     Once { inner: Some(value).into_iter() }
-}
-
-/// Functions for lexicographical ordering of sequences.
-///
-/// Lexicographical ordering through `<`, `<=`, `>=`, `>` requires
-/// that the elements implement both `PartialEq` and `PartialOrd`.
-///
-/// If two sequences are equal up until the point where one ends,
-/// the shorter sequence compares less.
-#[rustc_deprecated(since = "1.4.0", reason = "use the equivalent methods on `Iterator` instead")]
-#[unstable(feature = "iter_order_deprecated", reason = "needs review and revision",
-           issue = "27737")]
-pub mod order {
-    use cmp;
-    use cmp::{Eq, Ord, PartialOrd, PartialEq};
-    use option::Option;
-    use super::Iterator;
-
-    /// Compare `a` and `b` for equality using `Eq`
-    pub fn equals<A, L, R>(a: L, b: R) -> bool where
-        A: Eq,
-        L: Iterator<Item=A>,
-        R: Iterator<Item=A>,
-    {
-        a.eq(b)
-    }
-
-    /// Order `a` and `b` lexicographically using `Ord`
-    pub fn cmp<A, L, R>(a: L, b: R) -> cmp::Ordering where
-        A: Ord,
-        L: Iterator<Item=A>,
-        R: Iterator<Item=A>,
-    {
-        a.cmp(b)
-    }
-
-    /// Order `a` and `b` lexicographically using `PartialOrd`
-    pub fn partial_cmp<L: Iterator, R: Iterator>(a: L, b: R) -> Option<cmp::Ordering> where
-        L::Item: PartialOrd<R::Item>
-    {
-        a.partial_cmp(b)
-    }
-
-    /// Compare `a` and `b` for equality (Using partial equality, `PartialEq`)
-    pub fn eq<L: Iterator, R: Iterator>(a: L, b: R) -> bool where
-        L::Item: PartialEq<R::Item>,
-    {
-        a.eq(b)
-    }
-
-    /// Compares `a` and `b` for nonequality (Using partial equality, `PartialEq`)
-    pub fn ne<L: Iterator, R: Iterator>(a: L, b: R) -> bool where
-        L::Item: PartialEq<R::Item>,
-    {
-        a.ne(b)
-    }
-
-    /// Returns `a` < `b` lexicographically (Using partial order, `PartialOrd`)
-    pub fn lt<L: Iterator, R: Iterator>(a: L, b: R) -> bool where
-        L::Item: PartialOrd<R::Item>,
-    {
-        a.lt(b)
-    }
-
-    /// Returns `a` <= `b` lexicographically (Using partial order, `PartialOrd`)
-    pub fn le<L: Iterator, R: Iterator>(a: L, b: R) -> bool where
-        L::Item: PartialOrd<R::Item>,
-    {
-        a.le(b)
-    }
-
-    /// Returns `a` > `b` lexicographically (Using partial order, `PartialOrd`)
-    pub fn gt<L: Iterator, R: Iterator>(a: L, b: R) -> bool where
-        L::Item: PartialOrd<R::Item>,
-    {
-        a.gt(b)
-    }
-
-    /// Returns `a` >= `b` lexicographically (Using partial order, `PartialOrd`)
-    pub fn ge<L: Iterator, R: Iterator>(a: L, b: R) -> bool where
-        L::Item: PartialOrd<R::Item>,
-    {
-        a.ge(b)
-    }
 }

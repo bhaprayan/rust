@@ -20,10 +20,9 @@ pub use self::CallArgs::*;
 
 use arena::TypedArena;
 use back::link;
-use session;
 use llvm::{self, ValueRef, get_params};
 use middle::cstore::LOCAL_CRATE;
-use middle::def;
+use middle::def::Def;
 use middle::def_id::DefId;
 use middle::infer;
 use middle::subst;
@@ -51,12 +50,14 @@ use trans::meth;
 use trans::monomorphize;
 use trans::type_::Type;
 use trans::type_of;
-use middle::ty::{self, Ty, HasTypeFlags, RegionEscape};
+use trans::Disr;
+use middle::ty::{self, Ty, TyCtxt, TypeFoldable};
 use middle::ty::MethodCall;
 use rustc_front::hir;
 
-use syntax::abi as synabi;
+use syntax::abi::Abi;
 use syntax::ast;
+use syntax::errors;
 use syntax::ptr::P;
 
 #[derive(Copy, Clone)]
@@ -68,7 +69,7 @@ pub struct MethodData {
 pub enum CalleeData<'tcx> {
     // Constructor for enum variant/tuple-like-struct
     // i.e. Some, Ok
-    NamedTupleConstructor(ty::Disr),
+    NamedTupleConstructor(Disr),
 
     // Represents a (possibly monomorphized) top-level fn item or method
     // item. Note that this is just the fn-ptr and is not a Rust closure
@@ -132,13 +133,13 @@ fn trans<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, expr: &hir::Expr)
     }
 
     fn trans_def<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
-                             def: def::Def,
+                             def: Def,
                              ref_expr: &hir::Expr)
                              -> Callee<'blk, 'tcx> {
         debug!("trans_def(def={:?}, ref_expr={:?})", def, ref_expr);
         let expr_ty = common::node_id_type(bcx, ref_expr.id);
         match def {
-            def::DefFn(did, _) if {
+            Def::Fn(did) if {
                 let maybe_def_id = inline::get_local_instance(bcx.ccx(), did);
                 let maybe_ast_node = maybe_def_id.and_then(|def_id| {
                     let node_id = bcx.tcx().map.as_local_node_id(def_id).unwrap();
@@ -151,13 +152,13 @@ fn trans<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, expr: &hir::Expr)
             } => {
                 Callee {
                     bcx: bcx,
-                    data: NamedTupleConstructor(0),
+                    data: NamedTupleConstructor(Disr(0)),
                     ty: expr_ty
                 }
             }
-            def::DefFn(did, _) if match expr_ty.sty {
-                ty::TyBareFn(_, ref f) => f.abi == synabi::RustIntrinsic ||
-                                          f.abi == synabi::PlatformIntrinsic,
+            Def::Fn(did) if match expr_ty.sty {
+                ty::TyBareFn(_, ref f) => f.abi == Abi::RustIntrinsic ||
+                                          f.abi == Abi::PlatformIntrinsic,
                 _ => false
             } => {
                 let substs = common::node_id_substs(bcx.ccx(),
@@ -167,11 +168,11 @@ fn trans<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, expr: &hir::Expr)
                 let node_id = bcx.tcx().map.as_local_node_id(def_id).unwrap();
                 Callee { bcx: bcx, data: Intrinsic(node_id, substs), ty: expr_ty }
             }
-            def::DefFn(did, _) => {
+            Def::Fn(did) => {
                 fn_callee(bcx, trans_fn_ref(bcx.ccx(), did, ExprId(ref_expr.id),
                                             bcx.fcx.param_substs))
             }
-            def::DefMethod(meth_did) => {
+            Def::Method(meth_did) => {
                 let method_item = bcx.tcx().impl_or_trait_item(meth_did);
                 let fn_datum = match method_item.container() {
                     ty::ImplContainer(_) => {
@@ -189,34 +190,34 @@ fn trans<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, expr: &hir::Expr)
                 };
                 fn_callee(bcx, fn_datum)
             }
-            def::DefVariant(tid, vid, _) => {
+            Def::Variant(tid, vid) => {
                 let vinfo = bcx.tcx().lookup_adt_def(tid).variant_with_id(vid);
                 assert_eq!(vinfo.kind(), ty::VariantKind::Tuple);
 
                 Callee {
                     bcx: bcx,
-                    data: NamedTupleConstructor(vinfo.disr_val),
+                    data: NamedTupleConstructor(Disr::from(vinfo.disr_val)),
                     ty: expr_ty
                 }
             }
-            def::DefStruct(_) => {
+            Def::Struct(..) => {
                 Callee {
                     bcx: bcx,
-                    data: NamedTupleConstructor(0),
+                    data: NamedTupleConstructor(Disr(0)),
                     ty: expr_ty
                 }
             }
-            def::DefStatic(..) |
-            def::DefConst(..) |
-            def::DefAssociatedConst(..) |
-            def::DefLocal(..) |
-            def::DefUpvar(..) => {
+            Def::Static(..) |
+            Def::Const(..) |
+            Def::AssociatedConst(..) |
+            Def::Local(..) |
+            Def::Upvar(..) => {
                 datum_callee(bcx, ref_expr)
             }
-            def::DefMod(..) | def::DefForeignMod(..) | def::DefTrait(..) |
-            def::DefTy(..) | def::DefPrimTy(..) | def::DefAssociatedTy(..) |
-            def::DefUse(..) | def::DefLabel(..) | def::DefTyParam(..) |
-            def::DefSelfTy(..) => {
+            Def::Mod(..) | Def::ForeignMod(..) | Def::Trait(..) |
+            Def::Enum(..) | Def::TyAlias(..) | Def::PrimTy(..) |
+            Def::AssociatedTy(..) | Def::Label(..) | Def::TyParam(..) |
+            Def::SelfTy(..) | Def::Err => {
                 bcx.tcx().sess.span_bug(
                     ref_expr.span,
                     &format!("cannot translate def {:?} \
@@ -293,7 +294,7 @@ pub fn trans_fn_pointer_shim<'a, 'tcx>(
         match bare_fn_ty.sty {
             ty::TyBareFn(opt_def_id,
                            &ty::BareFnTy { unsafety: hir::Unsafety::Normal,
-                                           abi: synabi::Rust,
+                                           abi: Abi::Rust,
                                            ref sig }) => {
                 (opt_def_id, sig)
             }
@@ -309,7 +310,7 @@ pub fn trans_fn_pointer_shim<'a, 'tcx>(
     let tuple_fn_ty = tcx.mk_fn(opt_def_id,
         tcx.mk_bare_fn(ty::BareFnTy {
             unsafety: hir::Unsafety::Normal,
-            abi: synabi::RustCall,
+            abi: Abi::RustCall,
             sig: ty::Binder(ty::FnSig {
                 inputs: vec![bare_fn_ty_maybe_ref,
                              tuple_input_ty],
@@ -407,13 +408,13 @@ pub fn trans_fn_ref_with_substs<'a, 'tcx>(
     // def_id to the local id of the inlined copy.
     let def_id = inline::maybe_instantiate_inline(ccx, def_id);
 
-    fn is_named_tuple_constructor(tcx: &ty::ctxt, def_id: DefId) -> bool {
+    fn is_named_tuple_constructor(tcx: &TyCtxt, def_id: DefId) -> bool {
         let node_id = match tcx.map.as_local_node_id(def_id) {
             Some(n) => n,
             None => { return false; }
         };
-        let map_node = session::expect(
-            &tcx.sess,
+        let map_node = errors::expect(
+            &tcx.sess.diagnostic(),
             tcx.map.find(node_id),
             || "local item should be in ast map".to_string());
 
@@ -621,7 +622,7 @@ pub fn trans_call_inner<'a, 'blk, 'tcx, F>(bcx: Block<'blk, 'tcx>,
             (d.llfn, Some(d.llself))
         }
         Intrinsic(node, substs) => {
-            assert!(abi == synabi::RustIntrinsic || abi == synabi::PlatformIntrinsic);
+            assert!(abi == Abi::RustIntrinsic || abi == Abi::PlatformIntrinsic);
             assert!(dest.is_some());
 
             let call_info = match debug_loc {
@@ -651,9 +652,9 @@ pub fn trans_call_inner<'a, 'blk, 'tcx, F>(bcx: Block<'blk, 'tcx>,
 
     // Intrinsics should not become actual functions.
     // We trans them in place in `trans_intrinsic_call`
-    assert!(abi != synabi::RustIntrinsic && abi != synabi::PlatformIntrinsic);
+    assert!(abi != Abi::RustIntrinsic && abi != Abi::PlatformIntrinsic);
 
-    let is_rust_fn = abi == synabi::Rust || abi == synabi::RustCall;
+    let is_rust_fn = abi == Abi::Rust || abi == Abi::RustCall;
 
     // Generate a location to store the result. If the user does
     // not care about the result, just make a stack slot.
@@ -754,7 +755,7 @@ pub fn trans_call_inner<'a, 'blk, 'tcx, F>(bcx: Block<'blk, 'tcx>,
 
         let mut llargs = Vec::new();
         let arg_tys = match args {
-            ArgExprs(a) => a.iter().map(|x| common::expr_ty_adjusted(bcx, &**x)).collect(),
+            ArgExprs(a) => a.iter().map(|x| common::expr_ty_adjusted(bcx, &x)).collect(),
             _ => panic!("expected arg exprs.")
         };
         bcx = trans_args(bcx,
@@ -834,7 +835,7 @@ fn trans_args_under_call_abi<'blk, 'tcx>(
 
     // Translate the `self` argument first.
     if !ignore_self {
-        let arg_datum = unpack_datum!(bcx, expr::trans(bcx, &*arg_exprs[0]));
+        let arg_datum = unpack_datum!(bcx, expr::trans(bcx, &arg_exprs[0]));
         bcx = trans_arg_datum(bcx,
                               args[0],
                               arg_datum,
@@ -850,20 +851,20 @@ fn trans_args_under_call_abi<'blk, 'tcx>(
     match tuple_type.sty {
         ty::TyTuple(ref field_types) => {
             let tuple_datum = unpack_datum!(bcx,
-                                            expr::trans(bcx, &**tuple_expr));
+                                            expr::trans(bcx, &tuple_expr));
             let tuple_lvalue_datum =
                 unpack_datum!(bcx,
                               tuple_datum.to_lvalue_datum(bcx,
                                                           "args",
                                                           tuple_expr.id));
             let repr = adt::represent_type(bcx.ccx(), tuple_type);
-            let repr_ptr = &*repr;
+            let repr_ptr = &repr;
             for (i, field_type) in field_types.iter().enumerate() {
                 let arg_datum = tuple_lvalue_datum.get_element(
                     bcx,
                     field_type,
                     |srcval| {
-                        adt::trans_field_ptr(bcx, repr_ptr, srcval, 0, i)
+                        adt::trans_field_ptr(bcx, repr_ptr, srcval, Disr(0), i)
                     }).to_expr_datum();
                 bcx = trans_arg_datum(bcx,
                                       field_type,
@@ -935,7 +936,7 @@ pub fn trans_args<'a, 'blk, 'tcx>(cx: Block<'blk, 'tcx>,
                                   llargs: &mut Vec<ValueRef>,
                                   arg_cleanup_scope: cleanup::ScopeId,
                                   ignore_self: bool,
-                                  abi: synabi::Abi)
+                                  abi: Abi)
                                   -> Block<'blk, 'tcx> {
     debug!("trans_args(abi={})", abi);
 
@@ -952,7 +953,7 @@ pub fn trans_args<'a, 'blk, 'tcx>(cx: Block<'blk, 'tcx>,
     // to cast her view of the arguments to the caller's view.
     match args {
         ArgExprs(arg_exprs) => {
-            if abi == synabi::RustCall {
+            if abi == Abi::RustCall {
                 // This is only used for direct calls to the `call`,
                 // `call_mut` or `call_once` functions.
                 return trans_args_under_call_abi(cx,
@@ -970,12 +971,12 @@ pub fn trans_args<'a, 'blk, 'tcx>(cx: Block<'blk, 'tcx>,
                 }
                 let arg_ty = if i >= num_formal_args {
                     assert!(variadic);
-                    common::expr_ty_adjusted(cx, &**arg_expr)
+                    common::expr_ty_adjusted(cx, &arg_expr)
                 } else {
                     arg_tys[i]
                 };
 
-                let arg_datum = unpack_datum!(bcx, expr::trans(bcx, &**arg_expr));
+                let arg_datum = unpack_datum!(bcx, expr::trans(bcx, &arg_expr));
                 bcx = trans_arg_datum(bcx, arg_ty, arg_datum,
                                       arg_cleanup_scope,
                                       DontAutorefArg,

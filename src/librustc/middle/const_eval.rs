@@ -17,16 +17,20 @@ use self::EvalHint::*;
 use front::map as ast_map;
 use front::map::blocks::FnLikeNode;
 use middle::cstore::{self, CrateStore, InlinedItem};
-use middle::{def, infer, subst, traits};
+use middle::{infer, subst, traits};
+use middle::def::Def;
+use middle::subst::Subst;
 use middle::def_id::DefId;
 use middle::pat_util::def_to_path;
-use middle::ty::{self, Ty};
+use middle::ty::{self, Ty, TyCtxt};
 use middle::astconv_util::ast_ty_to_prim_ty;
 use util::num::ToPrimitive;
 use util::nodemap::NodeMap;
+use session::Session;
 
-use syntax::{ast, abi};
-use rustc_front::hir::Expr;
+use graphviz::IntoCow;
+use syntax::ast;
+use rustc_front::hir::{Expr, PatKind};
 use rustc_front::hir;
 use rustc_front::intravisit::FnKind;
 use syntax::codemap::Span;
@@ -34,8 +38,7 @@ use syntax::parse::token::InternedString;
 use syntax::ptr::P;
 use syntax::codemap;
 
-use std::borrow::{Cow, IntoCow};
-use std::num::wrapping::OverflowingOps;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry::Vacant;
 use std::hash;
@@ -43,25 +46,11 @@ use std::mem::transmute;
 use std::{i8, i16, i32, i64, u8, u16, u32, u64};
 use std::rc::Rc;
 
-fn lookup_const<'a>(tcx: &'a ty::ctxt, e: &Expr) -> Option<&'a Expr> {
-    let opt_def = tcx.def_map.borrow().get(&e.id).map(|d| d.full_def());
-    match opt_def {
-        Some(def::DefConst(def_id)) |
-        Some(def::DefAssociatedConst(def_id)) => {
-            lookup_const_by_id(tcx, def_id, Some(e.id))
-        }
-        Some(def::DefVariant(enum_def, variant_def, _)) => {
-            lookup_variant_by_id(tcx, enum_def, variant_def)
-        }
-        _ => None
-    }
-}
-
-fn lookup_variant_by_id<'a>(tcx: &'a ty::ctxt,
+fn lookup_variant_by_id<'a>(tcx: &'a TyCtxt,
                             enum_def: DefId,
                             variant_def: DefId)
                             -> Option<&'a Expr> {
-    fn variant_expr<'a>(variants: &'a [P<hir::Variant>], id: ast::NodeId)
+    fn variant_expr<'a>(variants: &'a [hir::Variant], id: ast::NodeId)
                         -> Option<&'a Expr> {
         for variant in variants {
             if variant.node.data.id() == id {
@@ -77,7 +66,7 @@ fn lookup_variant_by_id<'a>(tcx: &'a ty::ctxt,
             None => None,
             Some(ast_map::NodeItem(it)) => match it.node {
                 hir::ItemEnum(hir::EnumDef { ref variants }, _) => {
-                    variant_expr(&variants[..], variant_node_id)
+                    variant_expr(variants, variant_node_id)
                 }
                 _ => None
             },
@@ -88,16 +77,24 @@ fn lookup_variant_by_id<'a>(tcx: &'a ty::ctxt,
     }
 }
 
-pub fn lookup_const_by_id<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
+/// * `def_id` is the id of the constant.
+/// * `maybe_ref_id` is the id of the expr referencing the constant.
+/// * `param_substs` is the monomorphization substitution for the expression.
+///
+/// `maybe_ref_id` and `param_substs` are optional and are used for
+/// finding substitutions in associated constants. This generally
+/// happens in late/trans const evaluation.
+pub fn lookup_const_by_id<'a, 'tcx: 'a>(tcx: &'a TyCtxt<'tcx>,
                                         def_id: DefId,
-                                        maybe_ref_id: Option<ast::NodeId>)
+                                        maybe_ref_id: Option<ast::NodeId>,
+                                        param_substs: Option<&'tcx subst::Substs<'tcx>>)
                                         -> Option<&'tcx Expr> {
     if let Some(node_id) = tcx.map.as_local_node_id(def_id) {
         match tcx.map.find(node_id) {
             None => None,
             Some(ast_map::NodeItem(it)) => match it.node {
                 hir::ItemConst(_, ref const_expr) => {
-                    Some(&*const_expr)
+                    Some(&const_expr)
                 }
                 _ => None
             },
@@ -111,8 +108,11 @@ pub fn lookup_const_by_id<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
                         Some(ref_id) => {
                             let trait_id = tcx.trait_of_item(def_id)
                                               .unwrap();
-                            let substs = tcx.node_id_item_substs(ref_id)
-                                            .substs;
+                            let mut substs = tcx.node_id_item_substs(ref_id)
+                                                .substs;
+                            if let Some(param_substs) = param_substs {
+                                substs = substs.subst(tcx, param_substs);
+                            }
                             resolve_trait_associated_const(tcx, ti, trait_id,
                                                            substs)
                         }
@@ -129,7 +129,7 @@ pub fn lookup_const_by_id<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
             },
             Some(ast_map::NodeImplItem(ii)) => match ii.node {
                 hir::ImplItemKind::Const(_, ref expr) => {
-                    Some(&*expr)
+                    Some(&expr)
                 }
                 _ => None
             },
@@ -158,8 +158,11 @@ pub fn lookup_const_by_id<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
                         // a trait-associated const if the caller gives us
                         // the expression that refers to it.
                         Some(ref_id) => {
-                            let substs = tcx.node_id_item_substs(ref_id)
-                                            .substs;
+                            let mut substs = tcx.node_id_item_substs(ref_id)
+                                                .substs;
+                            if let Some(param_substs) = param_substs {
+                                substs = substs.subst(tcx, param_substs);
+                            }
                             resolve_trait_associated_const(tcx, ti, trait_id,
                                                            substs).map(|e| e.id)
                         }
@@ -186,7 +189,7 @@ pub fn lookup_const_by_id<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
     }
 }
 
-fn inline_const_fn_from_external_crate(tcx: &ty::ctxt, def_id: DefId)
+fn inline_const_fn_from_external_crate(tcx: &TyCtxt, def_id: DefId)
                                        -> Option<ast::NodeId> {
     match tcx.extern_const_fns.borrow().get(&def_id) {
         Some(&ast::DUMMY_NODE_ID) => return None,
@@ -209,7 +212,7 @@ fn inline_const_fn_from_external_crate(tcx: &ty::ctxt, def_id: DefId)
     fn_id
 }
 
-pub fn lookup_const_fn_by_id<'tcx>(tcx: &ty::ctxt<'tcx>, def_id: DefId)
+pub fn lookup_const_fn_by_id<'tcx>(tcx: &TyCtxt<'tcx>, def_id: DefId)
                                    -> Option<FnLikeNode<'tcx>>
 {
     let fn_id = if let Some(node_id) = tcx.map.as_local_node_id(def_id) {
@@ -242,7 +245,7 @@ pub fn lookup_const_fn_by_id<'tcx>(tcx: &ty::ctxt<'tcx>, def_id: DefId)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, RustcEncodable, RustcDecodable)]
 pub enum ConstVal {
     Float(f64),
     Int(i64),
@@ -319,10 +322,10 @@ impl ConstVal {
     }
 }
 
-pub fn const_expr_to_pat(tcx: &ty::ctxt, expr: &Expr, span: Span) -> P<hir::Pat> {
+pub fn const_expr_to_pat(tcx: &TyCtxt, expr: &Expr, span: Span) -> P<hir::Pat> {
     let pat = match expr.node {
         hir::ExprTup(ref exprs) =>
-            hir::PatTup(exprs.iter().map(|expr| const_expr_to_pat(tcx, &**expr, span)).collect()),
+            PatKind::Tup(exprs.iter().map(|expr| const_expr_to_pat(tcx, &expr, span)).collect()),
 
         hir::ExprCall(ref callee, ref args) => {
             let def = *tcx.def_map.borrow().get(&callee.id).unwrap();
@@ -330,12 +333,17 @@ pub fn const_expr_to_pat(tcx: &ty::ctxt, expr: &Expr, span: Span) -> P<hir::Pat>
                entry.insert(def);
             }
             let path = match def.full_def() {
-                def::DefStruct(def_id) => def_to_path(tcx, def_id),
-                def::DefVariant(_, variant_did, _) => def_to_path(tcx, variant_did),
+                Def::Struct(def_id) => def_to_path(tcx, def_id),
+                Def::Variant(_, variant_did) => def_to_path(tcx, variant_did),
+                Def::Fn(..) => return P(hir::Pat {
+                    id: expr.id,
+                    node: PatKind::Lit(P(expr.clone())),
+                    span: span,
+                }),
                 _ => unreachable!()
             };
-            let pats = args.iter().map(|expr| const_expr_to_pat(tcx, &**expr, span)).collect();
-            hir::PatEnum(path, Some(pats))
+            let pats = args.iter().map(|expr| const_expr_to_pat(tcx, &expr, span)).collect();
+            PatKind::TupleStruct(path, Some(pats))
         }
 
         hir::ExprStruct(ref path, ref fields, None) => {
@@ -343,40 +351,38 @@ pub fn const_expr_to_pat(tcx: &ty::ctxt, expr: &Expr, span: Span) -> P<hir::Pat>
                 span: codemap::DUMMY_SP,
                 node: hir::FieldPat {
                     name: field.name.node,
-                    pat: const_expr_to_pat(tcx, &*field.expr, span),
+                    pat: const_expr_to_pat(tcx, &field.expr, span),
                     is_shorthand: false,
                 },
             }).collect();
-            hir::PatStruct(path.clone(), field_pats, false)
+            PatKind::Struct(path.clone(), field_pats, false)
         }
 
         hir::ExprVec(ref exprs) => {
-            let pats = exprs.iter().map(|expr| const_expr_to_pat(tcx, &**expr, span)).collect();
-            hir::PatVec(pats, None, vec![])
+            let pats = exprs.iter().map(|expr| const_expr_to_pat(tcx, &expr, span)).collect();
+            PatKind::Vec(pats, None, hir::HirVec::new())
         }
 
         hir::ExprPath(_, ref path) => {
             let opt_def = tcx.def_map.borrow().get(&expr.id).map(|d| d.full_def());
             match opt_def {
-                Some(def::DefStruct(..)) =>
-                    hir::PatStruct(path.clone(), vec![], false),
-                Some(def::DefVariant(..)) =>
-                    hir::PatEnum(path.clone(), None),
-                _ => {
-                    match lookup_const(tcx, expr) {
-                        Some(actual) => return const_expr_to_pat(tcx, actual, span),
-                        _ => unreachable!()
-                    }
-                }
+                Some(Def::Struct(..)) | Some(Def::Variant(..)) =>
+                    PatKind::Path(path.clone()),
+                Some(Def::Const(def_id)) |
+                Some(Def::AssociatedConst(def_id)) => {
+                    let expr = lookup_const_by_id(tcx, def_id, Some(expr.id), None).unwrap();
+                    return const_expr_to_pat(tcx, expr, span);
+                },
+                _ => unreachable!(),
             }
         }
 
-        _ => hir::PatLit(P(expr.clone()))
+        _ => PatKind::Lit(P(expr.clone()))
     };
     P(hir::Pat { id: expr.id, node: pat, span: span })
 }
 
-pub fn eval_const_expr(tcx: &ty::ctxt, e: &Expr) -> ConstVal {
+pub fn eval_const_expr(tcx: &TyCtxt, e: &Expr) -> ConstVal {
     match eval_const_expr_partial(tcx, e, ExprTypeChecked, None) {
         Ok(r) => r,
         Err(s) => tcx.sess.span_fatal(s.span, &s.description())
@@ -515,41 +521,56 @@ pub enum EvalHint<'tcx> {
     UncheckedExprNoHint,
 }
 
+impl<'tcx> EvalHint<'tcx> {
+    fn erase_hint(&self) -> EvalHint<'tcx> {
+        match *self {
+            ExprTypeChecked => ExprTypeChecked,
+            UncheckedExprHint(_) | UncheckedExprNoHint => UncheckedExprNoHint,
+        }
+    }
+    fn checked_or(&self, ty: Ty<'tcx>) -> EvalHint<'tcx> {
+        match *self {
+            ExprTypeChecked => ExprTypeChecked,
+            _ => UncheckedExprHint(ty),
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum IntTy { I8, I16, I32, I64 }
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum UintTy { U8, U16, U32, U64 }
 
 impl IntTy {
-    pub fn from(tcx: &ty::ctxt, t: ast::IntTy) -> IntTy {
-        let t = if let ast::TyIs = t {
+    pub fn from(tcx: &TyCtxt, t: ast::IntTy) -> IntTy {
+        let t = if let ast::IntTy::Is = t {
             tcx.sess.target.int_type
         } else {
             t
         };
         match t {
-            ast::TyIs => unreachable!(),
-            ast::TyI8  => IntTy::I8,
-            ast::TyI16 => IntTy::I16,
-            ast::TyI32 => IntTy::I32,
-            ast::TyI64 => IntTy::I64,
+            ast::IntTy::Is => unreachable!(),
+            ast::IntTy::I8  => IntTy::I8,
+            ast::IntTy::I16 => IntTy::I16,
+            ast::IntTy::I32 => IntTy::I32,
+            ast::IntTy::I64 => IntTy::I64,
         }
     }
 }
 
 impl UintTy {
-    pub fn from(tcx: &ty::ctxt, t: ast::UintTy) -> UintTy {
-        let t = if let ast::TyUs = t {
+    pub fn from(tcx: &TyCtxt, t: ast::UintTy) -> UintTy {
+        let t = if let ast::UintTy::Us = t {
             tcx.sess.target.uint_type
         } else {
             t
         };
         match t {
-            ast::TyUs => unreachable!(),
-            ast::TyU8  => UintTy::U8,
-            ast::TyU16 => UintTy::U16,
-            ast::TyU32 => UintTy::U32,
-            ast::TyU64 => UintTy::U64,
+            ast::UintTy::Us => unreachable!(),
+            ast::UintTy::U8  => UintTy::U8,
+            ast::UintTy::U16 => UintTy::U16,
+            ast::UintTy::U32 => UintTy::U32,
+            ast::UintTy::U64 => UintTy::U64,
         }
     }
 }
@@ -789,7 +810,7 @@ pub_fn_checked_op!{ const_uint_checked_shr_via_int(a: u64, b: i64,.. UintTy) {
 /// guaranteed to be evaluatable. `ty_hint` is usually ExprTypeChecked,
 /// but a few places need to evaluate constants during type-checking, like
 /// computing the length of an array. (See also the FIXME above EvalHint.)
-pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
+pub fn eval_const_expr_partial<'tcx>(tcx: &TyCtxt<'tcx>,
                                      e: &Expr,
                                      ty_hint: EvalHint<'tcx>,
                                      fn_args: FnArgMap) -> EvalResult {
@@ -827,7 +848,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
 
     let result = match e.node {
       hir::ExprUnary(hir::UnNeg, ref inner) => {
-        match try!(eval_const_expr_partial(tcx, &**inner, ty_hint, fn_args)) {
+        match try!(eval_const_expr_partial(tcx, &inner, ty_hint, fn_args)) {
           Float(f) => Float(-f),
           Int(n) =>  try!(const_int_checked_neg(n, e, expr_int_type)),
           Uint(i) => {
@@ -837,7 +858,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
         }
       }
       hir::ExprUnary(hir::UnNot, ref inner) => {
-        match try!(eval_const_expr_partial(tcx, &**inner, ty_hint, fn_args)) {
+        match try!(eval_const_expr_partial(tcx, &inner, ty_hint, fn_args)) {
           Int(i) => Int(!i),
           Uint(i) => const_uint_not(i, expr_uint_type),
           Bool(b) => Bool(!b),
@@ -846,17 +867,11 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
       }
       hir::ExprBinary(op, ref a, ref b) => {
         let b_ty = match op.node {
-            hir::BiShl | hir::BiShr => {
-                if let ExprTypeChecked = ty_hint {
-                    ExprTypeChecked
-                } else {
-                    UncheckedExprHint(tcx.types.usize)
-                }
-            }
+            hir::BiShl | hir::BiShr => ty_hint.checked_or(tcx.types.usize),
             _ => ty_hint
         };
-        match (try!(eval_const_expr_partial(tcx, &**a, ty_hint, fn_args)),
-               try!(eval_const_expr_partial(tcx, &**b, b_ty, fn_args))) {
+        match (try!(eval_const_expr_partial(tcx, &a, ty_hint, fn_args)),
+               try!(eval_const_expr_partial(tcx, &b, b_ty, fn_args))) {
           (Float(a), Float(b)) => {
             match op.node {
               hir::BiAdd => Float(a + b),
@@ -947,7 +962,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
         }
       }
       hir::ExprCast(ref base, ref target_ty) => {
-        let ety = ety.or_else(|| ast_ty_to_prim_ty(tcx, &**target_ty))
+        let ety = ety.or_else(|| ast_ty_to_prim_ty(tcx, &target_ty))
                 .unwrap_or_else(|| {
                     tcx.sess.span_fatal(target_ty.span,
                                         "target type not found for const cast")
@@ -965,7 +980,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
             }
         };
 
-        let val = try!(eval_const_expr_partial(tcx, &**base, base_hint, fn_args));
+        let val = try!(eval_const_expr_partial(tcx, &base, base_hint, fn_args));
         match cast_const(tcx, val, ety) {
             Ok(val) => val,
             Err(kind) => return Err(ConstEvalErr { span: e.span, kind: kind }),
@@ -987,7 +1002,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
               None
           };
           let (const_expr, const_ty) = match opt_def {
-              Some(def::DefConst(def_id)) => {
+              Some(Def::Const(def_id)) => {
                   if let Some(node_id) = tcx.map.as_local_node_id(def_id) {
                       match tcx.map.find(node_id) {
                           Some(ast_map::NodeItem(it)) => match it.node {
@@ -999,12 +1014,12 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
                           _ => (None, None)
                       }
                   } else {
-                      (lookup_const_by_id(tcx, def_id, Some(e.id)), None)
+                      (lookup_const_by_id(tcx, def_id, Some(e.id), None), None)
                   }
               }
-              Some(def::DefAssociatedConst(def_id)) => {
+              Some(Def::AssociatedConst(def_id)) => {
                   if let Some(node_id) = tcx.map.as_local_node_id(def_id) {
-                      match tcx.impl_or_trait_item(def_id).container() {
+                      match impl_or_trait_container(tcx, def_id) {
                           ty::TraitContainer(trait_id) => match tcx.map.find(node_id) {
                               Some(ast_map::NodeTraitItem(ti)) => match ti.node {
                                   hir::ConstTraitItem(ref ty, _) => {
@@ -1034,24 +1049,24 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
                           },
                       }
                   } else {
-                      (lookup_const_by_id(tcx, def_id, Some(e.id)), None)
+                      (lookup_const_by_id(tcx, def_id, Some(e.id), None), None)
                   }
               }
-              Some(def::DefVariant(enum_def, variant_def, _)) => {
+              Some(Def::Variant(enum_def, variant_def)) => {
                   (lookup_variant_by_id(tcx, enum_def, variant_def), None)
               }
-              Some(def::DefStruct(_)) => {
+              Some(Def::Struct(..)) => {
                   return Ok(ConstVal::Struct(e.id))
               }
-              Some(def::DefLocal(_, id)) => {
-                  debug!("DefLocal({:?}): {:?}", id, fn_args);
+              Some(Def::Local(_, id)) => {
+                  debug!("Def::Local({:?}): {:?}", id, fn_args);
                   if let Some(val) = fn_args.and_then(|args| args.get(&id)) {
                       return Ok(val.clone());
                   } else {
                       (None, None)
                   }
               },
-              Some(def::DefMethod(id)) | Some(def::DefFn(id, _)) => return Ok(Function(id)),
+              Some(Def::Method(id)) | Some(Def::Fn(id)) => return Ok(Function(id)),
               _ => (None, None)
           };
           let const_expr = match const_expr {
@@ -1072,25 +1087,18 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
           try!(eval_const_expr_partial(tcx, const_expr, item_hint, fn_args))
       }
       hir::ExprCall(ref callee, ref args) => {
-          let sub_ty_hint = if let ExprTypeChecked = ty_hint {
-              ExprTypeChecked
-          } else {
-              UncheckedExprNoHint // we cannot reason about UncheckedExprHint here
-          };
+          let sub_ty_hint = ty_hint.erase_hint();
           let callee_val = try!(eval_const_expr_partial(tcx, callee, sub_ty_hint, fn_args));
-          let (decl, block, constness) = try!(get_fn_def(tcx, e, callee_val));
-          match (ty_hint, constness) {
-              (ExprTypeChecked, _) => {
-                  // no need to check for constness... either check_const
-                  // already forbids this or we const eval over whatever
-                  // we want
-              },
-              (_, hir::Constness::Const) => {
-                  // we don't know much about the function, so we force it to be a const fn
-                  // so compilation will fail later in case the const fn's body is not const
-              },
-              _ => signal!(e, NonConstPath),
-          }
+          let did = match callee_val {
+              Function(did) => did,
+              callee => signal!(e, CallOn(callee)),
+          };
+          let (decl, result) = if let Some(fn_like) = lookup_const_fn_by_id(tcx, did) {
+              (fn_like.decl(), &fn_like.body().expr)
+          } else {
+              signal!(e, NonConstPath)
+          };
+          let result = result.as_ref().expect("const fn has no result expression");
           assert_eq!(decl.inputs.len(), args.len());
 
           let mut call_args = NodeMap();
@@ -1105,36 +1113,26 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
               let old = call_args.insert(arg.pat.id, arg_val);
               assert!(old.is_none());
           }
-          let result = block.expr.as_ref().unwrap();
           debug!("const call({:?})", call_args);
-          try!(eval_const_expr_partial(tcx, &**result, ty_hint, Some(&call_args)))
+          try!(eval_const_expr_partial(tcx, &result, ty_hint, Some(&call_args)))
       },
-      hir::ExprLit(ref lit) => {
-          lit_to_const(&**lit, ety)
-      }
+      hir::ExprLit(ref lit) => lit_to_const(tcx.sess, e.span, &lit, ety),
       hir::ExprBlock(ref block) => {
         match block.expr {
-            Some(ref expr) => try!(eval_const_expr_partial(tcx, &**expr, ty_hint, fn_args)),
+            Some(ref expr) => try!(eval_const_expr_partial(tcx, &expr, ty_hint, fn_args)),
             None => unreachable!(),
         }
       }
+      hir::ExprType(ref e, _) => try!(eval_const_expr_partial(tcx, &e, ty_hint, fn_args)),
       hir::ExprTup(_) => Tuple(e.id),
       hir::ExprStruct(..) => Struct(e.id),
       hir::ExprIndex(ref arr, ref idx) => {
         if !tcx.sess.features.borrow().const_indexing {
             signal!(e, IndexOpFeatureGated);
         }
-        let arr_hint = if let ExprTypeChecked = ty_hint {
-            ExprTypeChecked
-        } else {
-            UncheckedExprNoHint
-        };
+        let arr_hint = ty_hint.erase_hint();
         let arr = try!(eval_const_expr_partial(tcx, arr, arr_hint, fn_args));
-        let idx_hint = if let ExprTypeChecked = ty_hint {
-            ExprTypeChecked
-        } else {
-            UncheckedExprHint(tcx.types.usize)
-        };
+        let idx_hint = ty_hint.checked_or(tcx.types.usize);
         let idx = match try!(eval_const_expr_partial(tcx, idx, idx_hint, fn_args)) {
             Int(i) if i >= 0 => i as u64,
             Int(_) => signal!(idx, IndexNegative),
@@ -1144,7 +1142,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
         match arr {
             Array(_, n) if idx >= n => signal!(e, IndexOutOfBounds),
             Array(v, _) => if let hir::ExprVec(ref v) = tcx.map.expect_expr(v).node {
-                try!(eval_const_expr_partial(tcx, &*v[idx as usize], ty_hint, fn_args))
+                try!(eval_const_expr_partial(tcx, &v[idx as usize], ty_hint, fn_args))
             } else {
                 unreachable!()
             },
@@ -1152,7 +1150,7 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
             Repeat(_, n) if idx >= n => signal!(e, IndexOutOfBounds),
             Repeat(elem, _) => try!(eval_const_expr_partial(
                 tcx,
-                &*tcx.map.expect_expr(elem),
+                &tcx.map.expect_expr(elem),
                 ty_hint,
                 fn_args,
             )),
@@ -1169,14 +1167,10 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
       }
       hir::ExprVec(ref v) => Array(e.id, v.len() as u64),
       hir::ExprRepeat(_, ref n) => {
-          let len_hint = if let ExprTypeChecked = ty_hint {
-              ExprTypeChecked
-          } else {
-              UncheckedExprHint(tcx.types.usize)
-          };
+          let len_hint = ty_hint.checked_or(tcx.types.usize);
           Repeat(
               e.id,
-              match try!(eval_const_expr_partial(tcx, &**n, len_hint, fn_args)) {
+              match try!(eval_const_expr_partial(tcx, &n, len_hint, fn_args)) {
                   Int(i) if i >= 0 => i as u64,
                   Int(_) => signal!(e, RepeatCountNotNatural),
                   Uint(i) => i,
@@ -1185,55 +1179,41 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
           )
       },
       hir::ExprTupField(ref base, index) => {
-        let base_hint = if let ExprTypeChecked = ty_hint {
-            ExprTypeChecked
-        } else {
-            UncheckedExprNoHint
-        };
-        if let Ok(c) = eval_const_expr_partial(tcx, base, base_hint, fn_args) {
-            if let Tuple(tup_id) = c {
-                if let hir::ExprTup(ref fields) = tcx.map.expect_expr(tup_id).node {
-                    if index.node < fields.len() {
-                        return eval_const_expr_partial(tcx, &fields[index.node], base_hint, fn_args)
-                    } else {
-                        signal!(e, TupleIndexOutOfBounds);
-                    }
+        let base_hint = ty_hint.erase_hint();
+        let c = try!(eval_const_expr_partial(tcx, base, base_hint, fn_args));
+        if let Tuple(tup_id) = c {
+            if let hir::ExprTup(ref fields) = tcx.map.expect_expr(tup_id).node {
+                if index.node < fields.len() {
+                    return eval_const_expr_partial(tcx, &fields[index.node], base_hint, fn_args)
                 } else {
-                    unreachable!()
+                    signal!(e, TupleIndexOutOfBounds);
                 }
             } else {
-                signal!(base, ExpectedConstTuple);
+                unreachable!()
             }
         } else {
-            signal!(base, NonConstPath)
+            signal!(base, ExpectedConstTuple);
         }
       }
       hir::ExprField(ref base, field_name) => {
+        let base_hint = ty_hint.erase_hint();
         // Get the base expression if it is a struct and it is constant
-        let base_hint = if let ExprTypeChecked = ty_hint {
-            ExprTypeChecked
-        } else {
-            UncheckedExprNoHint
-        };
-        if let Ok(c) = eval_const_expr_partial(tcx, base, base_hint, fn_args) {
-            if let Struct(struct_id) = c {
-                if let hir::ExprStruct(_, ref fields, _) = tcx.map.expect_expr(struct_id).node {
-                    // Check that the given field exists and evaluate it
-                    // if the idents are compared run-pass/issue-19244 fails
-                    if let Some(f) = fields.iter().find(|f| f.name.node
-                                                         == field_name.node) {
-                        return eval_const_expr_partial(tcx, &*f.expr, base_hint, fn_args)
-                    } else {
-                        signal!(e, MissingStructField);
-                    }
+        let c = try!(eval_const_expr_partial(tcx, base, base_hint, fn_args));
+        if let Struct(struct_id) = c {
+            if let hir::ExprStruct(_, ref fields, _) = tcx.map.expect_expr(struct_id).node {
+                // Check that the given field exists and evaluate it
+                // if the idents are compared run-pass/issue-19244 fails
+                if let Some(f) = fields.iter().find(|f| f.name.node
+                                                     == field_name.node) {
+                    return eval_const_expr_partial(tcx, &f.expr, base_hint, fn_args)
                 } else {
-                    unreachable!()
+                    signal!(e, MissingStructField);
                 }
             } else {
-                signal!(base, ExpectedConstStruct);
+                unreachable!()
             }
         } else {
-            signal!(base, NonConstPath);
+            signal!(base, ExpectedConstStruct);
         }
       }
       _ => signal!(e, MiscCatchAll)
@@ -1242,29 +1222,37 @@ pub fn eval_const_expr_partial<'tcx>(tcx: &ty::ctxt<'tcx>,
     Ok(result)
 }
 
-fn resolve_trait_associated_const<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
+fn impl_or_trait_container(tcx: &TyCtxt, def_id: DefId) -> ty::ImplOrTraitItemContainer {
+    // This is intended to be equivalent to tcx.impl_or_trait_item(def_id).container()
+    // for local def_id, but it can be called before tcx.impl_or_trait_items is complete.
+    if let Some(node_id) = tcx.map.as_local_node_id(def_id) {
+        if let Some(ast_map::NodeItem(item)) = tcx.map.find(tcx.map.get_parent_node(node_id)) {
+            let container_id = tcx.map.local_def_id(item.id);
+            match item.node {
+                hir::ItemImpl(..) => return ty::ImplContainer(container_id),
+                hir::ItemTrait(..) => return ty::TraitContainer(container_id),
+                _ => ()
+            }
+        }
+        panic!("No impl or trait container for {:?}", def_id);
+    }
+    panic!("{:?} is not local", def_id);
+}
+
+fn resolve_trait_associated_const<'a, 'tcx: 'a>(tcx: &'a TyCtxt<'tcx>,
                                                 ti: &'tcx hir::TraitItem,
                                                 trait_id: DefId,
                                                 rcvr_substs: subst::Substs<'tcx>)
                                                 -> Option<&'tcx Expr>
 {
-    let subst::SeparateVecsPerParamSpace {
-        types: rcvr_type,
-        selfs: rcvr_self,
-        fns: _,
-    } = rcvr_substs.types.split();
-    let trait_substs =
-        subst::Substs::erased(subst::VecPerParamSpace::new(rcvr_type,
-                                                           rcvr_self,
-                                                           Vec::new()));
-    let trait_substs = tcx.mk_substs(trait_substs);
-    debug!("resolve_trait_associated_const: trait_substs={:?}",
-           trait_substs);
-    let trait_ref = ty::Binder(ty::TraitRef { def_id: trait_id,
-                                              substs: trait_substs });
+    let trait_ref = ty::Binder(
+        rcvr_substs.erase_regions().to_trait_ref(tcx, trait_id)
+    );
+    debug!("resolve_trait_associated_const: trait_ref={:?}",
+           trait_ref);
 
     tcx.populate_implementations_for_trait_if_necessary(trait_ref.def_id());
-    let infcx = infer::new_infer_ctxt(tcx, &tcx.tables, None, false);
+    let infcx = infer::new_infer_ctxt(tcx, &tcx.tables, None);
 
     let mut selcx = traits::SelectionContext::new(&infcx);
     let obligation = traits::Obligation::new(traits::ObligationCause::dummy(),
@@ -1277,12 +1265,8 @@ fn resolve_trait_associated_const<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
         Ok(None) => {
             return None
         }
-        Err(e) => {
-            tcx.sess.span_bug(ti.span,
-                              &format!("Encountered error `{:?}` when trying \
-                                        to select an implementation for \
-                                        constant trait item reference.",
-                                       e))
+        Err(_) => {
+            return None
         }
     };
 
@@ -1290,7 +1274,7 @@ fn resolve_trait_associated_const<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
         traits::VtableImpl(ref impl_data) => {
             match tcx.associated_consts(impl_data.impl_def_id)
                      .iter().find(|ic| ic.name == ti.name) {
-                Some(ic) => lookup_const_by_id(tcx, ic.def_id, None),
+                Some(ic) => lookup_const_by_id(tcx, ic.def_id, None, None),
                 None => match ti.node {
                     hir::ConstTraitItem(_, Some(ref expr)) => Some(&*expr),
                     _ => None,
@@ -1305,7 +1289,7 @@ fn resolve_trait_associated_const<'a, 'tcx: 'a>(tcx: &'a ty::ctxt<'tcx>,
     }
 }
 
-fn cast_const<'tcx>(tcx: &ty::ctxt<'tcx>, val: ConstVal, ty: Ty) -> CastResult {
+fn cast_const<'tcx>(tcx: &TyCtxt<'tcx>, val: ConstVal, ty: Ty) -> CastResult {
     macro_rules! convert_val {
         ($intermediate_ty:ty, $const_type:ident, $target_ty:ty) => {
             match val {
@@ -1320,60 +1304,63 @@ fn cast_const<'tcx>(tcx: &ty::ctxt<'tcx>, val: ConstVal, ty: Ty) -> CastResult {
 
     // Issue #23890: If isize/usize, then dispatch to appropriate target representation type
     match (&ty.sty, tcx.sess.target.int_type, tcx.sess.target.uint_type) {
-        (&ty::TyInt(ast::TyIs), ast::TyI32, _) => return convert_val!(i32, Int, i64),
-        (&ty::TyInt(ast::TyIs), ast::TyI64, _) => return convert_val!(i64, Int, i64),
-        (&ty::TyInt(ast::TyIs), _, _) => panic!("unexpected target.int_type"),
+        (&ty::TyInt(ast::IntTy::Is), ast::IntTy::I32, _) => return convert_val!(i32, Int, i64),
+        (&ty::TyInt(ast::IntTy::Is), ast::IntTy::I64, _) => return convert_val!(i64, Int, i64),
+        (&ty::TyInt(ast::IntTy::Is), _, _) => panic!("unexpected target.int_type"),
 
-        (&ty::TyUint(ast::TyUs), _, ast::TyU32) => return convert_val!(u32, Uint, u64),
-        (&ty::TyUint(ast::TyUs), _, ast::TyU64) => return convert_val!(u64, Uint, u64),
-        (&ty::TyUint(ast::TyUs), _, _) => panic!("unexpected target.uint_type"),
+        (&ty::TyUint(ast::UintTy::Us), _, ast::UintTy::U32) => return convert_val!(u32, Uint, u64),
+        (&ty::TyUint(ast::UintTy::Us), _, ast::UintTy::U64) => return convert_val!(u64, Uint, u64),
+        (&ty::TyUint(ast::UintTy::Us), _, _) => panic!("unexpected target.uint_type"),
 
         _ => {}
     }
 
     match ty.sty {
-        ty::TyInt(ast::TyIs) => unreachable!(),
-        ty::TyUint(ast::TyUs) => unreachable!(),
+        ty::TyInt(ast::IntTy::Is) => unreachable!(),
+        ty::TyUint(ast::UintTy::Us) => unreachable!(),
 
-        ty::TyInt(ast::TyI8) => convert_val!(i8, Int, i64),
-        ty::TyInt(ast::TyI16) => convert_val!(i16, Int, i64),
-        ty::TyInt(ast::TyI32) => convert_val!(i32, Int, i64),
-        ty::TyInt(ast::TyI64) => convert_val!(i64, Int, i64),
+        ty::TyInt(ast::IntTy::I8) => convert_val!(i8, Int, i64),
+        ty::TyInt(ast::IntTy::I16) => convert_val!(i16, Int, i64),
+        ty::TyInt(ast::IntTy::I32) => convert_val!(i32, Int, i64),
+        ty::TyInt(ast::IntTy::I64) => convert_val!(i64, Int, i64),
 
-        ty::TyUint(ast::TyU8) => convert_val!(u8, Uint, u64),
-        ty::TyUint(ast::TyU16) => convert_val!(u16, Uint, u64),
-        ty::TyUint(ast::TyU32) => convert_val!(u32, Uint, u64),
-        ty::TyUint(ast::TyU64) => convert_val!(u64, Uint, u64),
+        ty::TyUint(ast::UintTy::U8) => convert_val!(u8, Uint, u64),
+        ty::TyUint(ast::UintTy::U16) => convert_val!(u16, Uint, u64),
+        ty::TyUint(ast::UintTy::U32) => convert_val!(u32, Uint, u64),
+        ty::TyUint(ast::UintTy::U64) => convert_val!(u64, Uint, u64),
 
-        ty::TyFloat(ast::TyF32) => convert_val!(f32, Float, f64),
-        ty::TyFloat(ast::TyF64) => convert_val!(f64, Float, f64),
+        ty::TyFloat(ast::FloatTy::F32) => convert_val!(f32, Float, f64),
+        ty::TyFloat(ast::FloatTy::F64) => convert_val!(f64, Float, f64),
         _ => Err(ErrKind::CannotCast),
     }
 }
 
-fn lit_to_const(lit: &ast::Lit, ty_hint: Option<Ty>) -> ConstVal {
+fn lit_to_const(sess: &Session, span: Span, lit: &ast::Lit, ty_hint: Option<Ty>) -> ConstVal {
     match lit.node {
-        ast::LitStr(ref s, _) => Str((*s).clone()),
-        ast::LitByteStr(ref data) => {
+        ast::LitKind::Str(ref s, _) => Str((*s).clone()),
+        ast::LitKind::ByteStr(ref data) => {
             ByteStr(data.clone())
         }
-        ast::LitByte(n) => Uint(n as u64),
-        ast::LitChar(n) => Uint(n as u64),
-        ast::LitInt(n, ast::SignedIntLit(_, ast::Plus)) => Int(n as i64),
-        ast::LitInt(n, ast::UnsuffixedIntLit(ast::Plus)) => {
+        ast::LitKind::Byte(n) => Uint(n as u64),
+        ast::LitKind::Char(n) => Uint(n as u64),
+        ast::LitKind::Int(n, ast::LitIntType::Signed(_)) => Int(n as i64),
+        ast::LitKind::Int(n, ast::LitIntType::Unsuffixed) => {
             match ty_hint.map(|ty| &ty.sty) {
                 Some(&ty::TyUint(_)) => Uint(n),
                 _ => Int(n as i64)
             }
         }
-        ast::LitInt(n, ast::SignedIntLit(_, ast::Minus)) |
-        ast::LitInt(n, ast::UnsuffixedIntLit(ast::Minus)) => Int(-(n as i64)),
-        ast::LitInt(n, ast::UnsignedIntLit(_)) => Uint(n),
-        ast::LitFloat(ref n, _) |
-        ast::LitFloatUnsuffixed(ref n) => {
-            Float(n.parse::<f64>().unwrap() as f64)
+        ast::LitKind::Int(n, ast::LitIntType::Unsigned(_)) => Uint(n),
+        ast::LitKind::Float(ref n, _) |
+        ast::LitKind::FloatUnsuffixed(ref n) => {
+            if let Ok(x) = n.parse::<f64>() {
+                Float(x)
+            } else {
+                // FIXME(#31407) this is only necessary because float parsing is buggy
+                sess.span_bug(span, "could not evaluate float literal (see issue #31407)");
+            }
         }
-        ast::LitBool(b) => Bool(b)
+        ast::LitKind::Bool(b) => Bool(b)
     }
 }
 
@@ -1398,7 +1385,7 @@ pub fn compare_const_vals(a: &ConstVal, b: &ConstVal) -> Option<Ordering> {
     })
 }
 
-pub fn compare_lit_exprs<'tcx>(tcx: &ty::ctxt<'tcx>,
+pub fn compare_lit_exprs<'tcx>(tcx: &TyCtxt<'tcx>,
                                a: &Expr,
                                b: &Expr) -> Option<Ordering> {
     let a = match eval_const_expr_partial(tcx, a, ExprTypeChecked, None) {
@@ -1416,47 +1403,4 @@ pub fn compare_lit_exprs<'tcx>(tcx: &ty::ctxt<'tcx>,
         }
     };
     compare_const_vals(&a, &b)
-}
-
-
-// returns Err if callee is not `Function`
-// `e` is only used for error reporting/spans
-fn get_fn_def<'a>(tcx: &'a ty::ctxt,
-                  e: &hir::Expr,
-                  callee: ConstVal)
-                  -> Result<(&'a hir::FnDecl, &'a hir::Block, hir::Constness), ConstEvalErr> {
-    let did = match callee {
-        Function(did) => did,
-        callee => signal!(e, CallOn(callee)),
-    };
-    debug!("fn call: {:?}", tcx.map.get_if_local(did));
-    match tcx.map.get_if_local(did) {
-        None => signal!(e, UnimplementedConstVal("calling non-local const fn")), // non-local
-        Some(ast_map::NodeItem(it)) => match it.node {
-            hir::ItemFn(
-                ref decl,
-                hir::Unsafety::Normal,
-                constness,
-                abi::Abi::Rust,
-                _, // ducktype generics? types are funky in const_eval
-                ref block,
-            ) => Ok((&**decl, &**block, constness)),
-            _ => signal!(e, NonConstPath),
-        },
-        Some(ast_map::NodeImplItem(it)) => match it.node {
-            hir::ImplItemKind::Method(
-                hir::MethodSig {
-                    ref decl,
-                    unsafety: hir::Unsafety::Normal,
-                    constness,
-                    abi: abi::Abi::Rust,
-                    .. // ducktype generics? types are funky in const_eval
-                },
-                ref block,
-            ) => Ok((decl, block, constness)),
-            _ => signal!(e, NonConstPath),
-        },
-        Some(ast_map::NodeTraitItem(..)) => signal!(e, NonConstPath),
-        Some(_) => unimplemented!(),
-    }
 }

@@ -12,10 +12,9 @@ use hir;
 use hir::*;
 use intravisit::{self, Visitor, FnKind};
 use syntax::ast_util;
-use syntax::ast::{Ident, Name, NodeId, DUMMY_NODE_ID};
+use syntax::ast::{Name, NodeId, DUMMY_NODE_ID};
 use syntax::codemap::Span;
 use syntax::ptr::P;
-use syntax::owned_slice::OwnedSlice;
 
 pub fn walk_pat<F>(pat: &Pat, mut it: F) -> bool
     where F: FnMut(&Pat) -> bool
@@ -24,32 +23,33 @@ pub fn walk_pat<F>(pat: &Pat, mut it: F) -> bool
     fn walk_pat_<G>(pat: &Pat, it: &mut G) -> bool
         where G: FnMut(&Pat) -> bool
     {
-        if !(*it)(pat) {
+        if !it(pat) {
             return false;
         }
 
         match pat.node {
-            PatIdent(_, _, Some(ref p)) => walk_pat_(&**p, it),
-            PatStruct(_, ref fields, _) => {
-                fields.iter().all(|field| walk_pat_(&*field.node.pat, it))
+            PatKind::Ident(_, _, Some(ref p)) => walk_pat_(&p, it),
+            PatKind::Struct(_, ref fields, _) => {
+                fields.iter().all(|field| walk_pat_(&field.node.pat, it))
             }
-            PatEnum(_, Some(ref s)) | PatTup(ref s) => {
-                s.iter().all(|p| walk_pat_(&**p, it))
+            PatKind::TupleStruct(_, Some(ref s)) | PatKind::Tup(ref s) => {
+                s.iter().all(|p| walk_pat_(&p, it))
             }
-            PatBox(ref s) | PatRegion(ref s, _) => {
-                walk_pat_(&**s, it)
+            PatKind::Box(ref s) | PatKind::Ref(ref s, _) => {
+                walk_pat_(&s, it)
             }
-            PatVec(ref before, ref slice, ref after) => {
-                before.iter().all(|p| walk_pat_(&**p, it)) &&
-                slice.iter().all(|p| walk_pat_(&**p, it)) &&
-                after.iter().all(|p| walk_pat_(&**p, it))
+            PatKind::Vec(ref before, ref slice, ref after) => {
+                before.iter().all(|p| walk_pat_(&p, it)) &&
+                slice.iter().all(|p| walk_pat_(&p, it)) &&
+                after.iter().all(|p| walk_pat_(&p, it))
             }
-            PatWild |
-            PatLit(_) |
-            PatRange(_, _) |
-            PatIdent(_, _, _) |
-            PatEnum(_, _) |
-            PatQPath(_, _) => {
+            PatKind::Wild |
+            PatKind::Lit(_) |
+            PatKind::Range(_, _) |
+            PatKind::Ident(_, _, _) |
+            PatKind::TupleStruct(..) |
+            PatKind::Path(..) |
+            PatKind::QPath(_, _) => {
                 true
             }
         }
@@ -271,7 +271,7 @@ impl<'a, 'v, O: ast_util::IdVisitingOperation> Visitor<'v> for IdVisitor<'a, O> 
     }
 
     fn visit_struct_field(&mut self, struct_field: &StructField) {
-        self.operation.visit_id(struct_field.node.id);
+        self.operation.visit_id(struct_field.id);
         intravisit::walk_struct_field(self, struct_field)
     }
 
@@ -335,11 +335,11 @@ pub fn is_path(e: P<Expr>) -> bool {
 
 pub fn empty_generics() -> Generics {
     Generics {
-        lifetimes: Vec::new(),
-        ty_params: OwnedSlice::empty(),
+        lifetimes: HirVec::new(),
+        ty_params: HirVec::new(),
         where_clause: WhereClause {
             id: DUMMY_NODE_ID,
-            predicates: Vec::new(),
+            predicates: HirVec::new(),
         },
     }
 }
@@ -350,13 +350,13 @@ pub fn ident_to_path(s: Span, ident: Ident) -> Path {
     hir::Path {
         span: s,
         global: false,
-        segments: vec!(hir::PathSegment {
+        segments: hir_vec![hir::PathSegment {
             identifier: ident,
             parameters: hir::AngleBracketedParameters(hir::AngleBracketedParameterData {
-                lifetimes: Vec::new(),
-                types: OwnedSlice::empty(),
-                bindings: OwnedSlice::empty(),
+                lifetimes: HirVec::new(),
+                types: HirVec::new(),
+                bindings: HirVec::new(),
             }),
-        }),
+        }],
     }
 }

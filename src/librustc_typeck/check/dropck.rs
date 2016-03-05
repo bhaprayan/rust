@@ -16,12 +16,11 @@ use middle::infer;
 use middle::region;
 use middle::subst::{self, Subst};
 use middle::traits;
-use middle::ty::{self, Ty};
+use middle::ty::{self, Ty, TyCtxt};
 use util::nodemap::FnvHashSet;
 
 use syntax::ast;
 use syntax::codemap::{self, Span};
-use syntax::parse::token::special_idents;
 
 /// check_drop_impl confirms that the Drop implementation identfied by
 /// `drop_impl_did` is not any more specialized than the type it is
@@ -40,7 +39,7 @@ use syntax::parse::token::special_idents;
 ///    struct/enum definition for the nominal type itself (i.e.
 ///    cannot do `struct S<T>; impl<T:Clone> Drop for S<T> { ... }`).
 ///
-pub fn check_drop_impl(tcx: &ty::ctxt, drop_impl_did: DefId) -> Result<(), ()> {
+pub fn check_drop_impl(tcx: &TyCtxt, drop_impl_did: DefId) -> Result<(), ()> {
     let ty::TypeScheme { generics: ref dtor_generics,
                          ty: dtor_self_type } = tcx.lookup_item_type(drop_impl_did);
     let dtor_predicates = tcx.lookup_predicates(drop_impl_did);
@@ -71,7 +70,7 @@ pub fn check_drop_impl(tcx: &ty::ctxt, drop_impl_did: DefId) -> Result<(), ()> {
 }
 
 fn ensure_drop_params_and_item_params_correspond<'tcx>(
-    tcx: &ty::ctxt<'tcx>,
+    tcx: &TyCtxt<'tcx>,
     drop_impl_did: DefId,
     drop_impl_generics: &ty::Generics<'tcx>,
     drop_impl_ty: &ty::Ty<'tcx>,
@@ -83,7 +82,8 @@ fn ensure_drop_params_and_item_params_correspond<'tcx>(
     // check that the impl type can be made to match the trait type.
 
     let impl_param_env = ty::ParameterEnvironment::for_item(tcx, self_type_node_id);
-    let infcx = infer::new_infer_ctxt(tcx, &tcx.tables, Some(impl_param_env), true);
+    let infcx = infer::new_infer_ctxt(tcx, &tcx.tables, Some(impl_param_env));
+    let mut fulfillment_cx = traits::FulfillmentContext::new();
 
     let named_type = tcx.lookup_item_type(self_type_did).ty;
     let named_type = named_type.subst(tcx, &infcx.parameter_environment.free_substs);
@@ -95,16 +95,17 @@ fn ensure_drop_params_and_item_params_correspond<'tcx>(
 
     if let Err(_) = infer::mk_eqty(&infcx, true, infer::TypeOrigin::Misc(drop_impl_span),
                                    named_type, fresh_impl_self_ty) {
-        span_err!(tcx.sess, drop_impl_span, E0366,
-                  "Implementations of Drop cannot be specialized");
         let item_span = tcx.map.span(self_type_node_id);
-        tcx.sess.span_note(item_span,
-                           "Use same sequence of generic type and region \
-                            parameters that is on the struct/enum definition");
+        struct_span_err!(tcx.sess, drop_impl_span, E0366,
+                         "Implementations of Drop cannot be specialized")
+            .span_note(item_span,
+                       "Use same sequence of generic type and region \
+                        parameters that is on the struct/enum definition")
+            .emit();
         return Err(());
     }
 
-    if let Err(ref errors) = infcx.fulfillment_cx.borrow_mut().select_all_or_error(&infcx) {
+    if let Err(ref errors) = fulfillment_cx.select_all_or_error(&infcx) {
         // this could be reached when we get lazy normalization
         traits::report_fulfillment_errors(&infcx, errors);
         return Err(());
@@ -118,7 +119,7 @@ fn ensure_drop_params_and_item_params_correspond<'tcx>(
 /// Confirms that every predicate imposed by dtor_predicates is
 /// implied by assuming the predicates attached to self_type_did.
 fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
-    tcx: &ty::ctxt<'tcx>,
+    tcx: &TyCtxt<'tcx>,
     drop_impl_did: DefId,
     dtor_predicates: &ty::GenericPredicates<'tcx>,
     self_type_did: DefId,
@@ -197,11 +198,12 @@ fn ensure_drop_predicates_are_implied_by_item_defn<'tcx>(
 
         if !assumptions_in_impl_context.contains(&predicate) {
             let item_span = tcx.map.span(self_type_node_id);
-            span_err!(tcx.sess, drop_impl_span, E0367,
-                      "The requirement `{}` is added only by the Drop impl.", predicate);
-            tcx.sess.span_note(item_span,
-                               "The same requirement must be part of \
-                                the struct/enum definition");
+            struct_span_err!(tcx.sess, drop_impl_span, E0367,
+                             "The requirement `{}` is added only by the Drop impl.", predicate)
+                .span_note(item_span,
+                           "The same requirement must be part of \
+                            the struct/enum definition")
+                .emit();
         }
     }
 
@@ -289,14 +291,14 @@ pub fn check_safety_of_destructor_if_necessary<'a, 'tcx>(rcx: &mut Rcx<'a, 'tcx>
         Ok(()) => {}
         Err(Error::Overflow(ref ctxt, ref detected_on_typ)) => {
             let tcx = rcx.tcx();
-            span_err!(tcx.sess, span, E0320,
-                      "overflow while adding drop-check rules for {}", typ);
+            let mut err = struct_span_err!(tcx.sess, span, E0320,
+                                           "overflow while adding drop-check rules for {}", typ);
             match *ctxt {
                 TypeContext::Root => {
                     // no need for an additional note if the overflow
                     // was somehow on the root.
                 }
-                TypeContext::ADT { def_id, variant, field, field_index } => {
+                TypeContext::ADT { def_id, variant, field } => {
                     let adt = tcx.lookup_adt_def(def_id);
                     let variant_name = match adt.adt_kind() {
                         ty::AdtKind::Enum => format!("enum {} variant {}",
@@ -305,20 +307,16 @@ pub fn check_safety_of_destructor_if_necessary<'a, 'tcx>(rcx: &mut Rcx<'a, 'tcx>
                         ty::AdtKind::Struct => format!("struct {}",
                                                        tcx.item_path_str(def_id))
                     };
-                    let field_name = if field == special_idents::unnamed_field.name {
-                        format!("#{}", field_index)
-                    } else {
-                        format!("`{}`", field)
-                    };
                     span_note!(
-                        rcx.tcx().sess,
+                        &mut err,
                         span,
                         "overflowed on {} field {} type: {}",
                         variant_name,
-                        field_name,
+                        field,
                         detected_on_typ);
                 }
             }
+            err.emit();
         }
     }
 }
@@ -334,7 +332,6 @@ enum TypeContext {
         def_id: DefId,
         variant: ast::Name,
         field: ast::Name,
-        field_index: usize
     }
 }
 
@@ -365,6 +362,10 @@ fn iterate_over_potentially_unsafe_regions_in_type<'a, 'b, 'tcx>(
         // use a higher recursion limit to avoid errors.
         return Err(Error::Overflow(context, ty))
     }
+
+    // canoncialize the regions in `ty` before inserting - infinitely many
+    // region variables can refer to the same region.
+    let ty = cx.rcx.infcx().resolve_type_and_region_vars_if_possible(&ty);
 
     if !cx.breadcrumbs.insert(ty) {
         debug!("iterate_over_potentially_unsafe_regions_in_type \
@@ -444,7 +445,7 @@ fn iterate_over_potentially_unsafe_regions_in_type<'a, 'b, 'tcx>(
         ty::TyStruct(def, substs) | ty::TyEnum(def, substs) => {
             let did = def.did;
             for variant in &def.variants {
-                for (i, field) in variant.fields.iter().enumerate() {
+                for field in variant.fields.iter() {
                     let fty = field.ty(tcx, substs);
                     let fty = cx.rcx.fcx.resolve_type_vars_if_possible(
                         cx.rcx.fcx.normalize_associated_types_in(cx.span, &fty));
@@ -454,7 +455,6 @@ fn iterate_over_potentially_unsafe_regions_in_type<'a, 'b, 'tcx>(
                             def_id: did,
                             field: field.name,
                             variant: variant.name,
-                            field_index: i
                         },
                         fty,
                         depth+1))
@@ -495,7 +495,7 @@ fn iterate_over_potentially_unsafe_regions_in_type<'a, 'b, 'tcx>(
     }
 }
 
-fn has_dtor_of_interest<'tcx>(tcx: &ty::ctxt<'tcx>,
+fn has_dtor_of_interest<'tcx>(tcx: &TyCtxt<'tcx>,
                               ty: ty::Ty<'tcx>) -> bool {
     match ty.sty {
         ty::TyEnum(def, _) | ty::TyStruct(def, _) => {

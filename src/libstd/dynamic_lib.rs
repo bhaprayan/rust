@@ -16,7 +16,6 @@
             reason = "API has not been scrutinized and is highly likely to \
                       either disappear or change",
             issue = "27810")]
-#![rustc_deprecated(since = "1.5.0", reason = "replaced with crates.io crates")]
 #![allow(missing_docs)]
 #![allow(deprecated)]
 
@@ -26,6 +25,11 @@ use env;
 use ffi::{CString, OsString};
 use path::{Path, PathBuf};
 
+#[unstable(feature = "dynamic_lib",
+           reason = "API has not been scrutinized and is highly likely to \
+                     either disappear or change",
+           issue = "27810")]
+#[rustc_deprecated(since = "1.5.0", reason = "replaced with 'dylib' on crates.io")]
 pub struct DynamicLibrary {
     handle: *mut u8
 }
@@ -43,6 +47,11 @@ impl Drop for DynamicLibrary {
     }
 }
 
+#[unstable(feature = "dynamic_lib",
+           reason = "API has not been scrutinized and is highly likely to \
+                     either disappear or change",
+           issue = "27810")]
+#[rustc_deprecated(since = "1.5.0", reason = "replaced with 'dylib' on crates.io")]
 impl DynamicLibrary {
     /// Lazily open a dynamic library. When passed None it gives a
     /// handle to the calling process
@@ -126,12 +135,12 @@ mod tests {
     use prelude::v1::*;
     use libc;
     use mem;
-    use path::Path;
 
     #[test]
     #[cfg_attr(any(windows,
                    target_os = "android",  // FIXME #10379
                    target_env = "musl"), ignore)]
+    #[allow(deprecated)]
     fn test_loading_cosine() {
         // The math library does not need to be loaded since it is already
         // statically linked in
@@ -163,8 +172,12 @@ mod tests {
               target_os = "dragonfly",
               target_os = "bitrig",
               target_os = "netbsd",
-              target_os = "openbsd"))]
+              target_os = "openbsd",
+              target_os = "solaris"))]
+    #[allow(deprecated)]
     fn test_errors_do_not_crash() {
+        use path::Path;
+
         // Open /dev/null as a library to get an error, and make sure
         // that only causes an error, and not a crash.
         let path = Path::new("/dev/null");
@@ -183,7 +196,9 @@ mod tests {
           target_os = "dragonfly",
           target_os = "bitrig",
           target_os = "netbsd",
-          target_os = "openbsd"))]
+          target_os = "openbsd",
+          target_os = "solaris",
+          target_os = "emscripten"))]
 mod dl {
     use prelude::v1::*;
 

@@ -8,32 +8,33 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use middle::def::DefFn;
+use dep_graph::DepNode;
+use middle::def::Def;
 use middle::def_id::DefId;
 use middle::subst::{Subst, Substs, EnumeratedItems};
-use middle::ty::{TransmuteRestriction, ctxt, TyBareFn};
-use middle::ty::{self, Ty, HasTypeFlags};
+use middle::ty::{TransmuteRestriction, TyCtxt, TyBareFn};
+use middle::ty::{self, Ty, TypeFoldable};
 
 use std::fmt;
 
-use syntax::abi::RustIntrinsic;
+use syntax::abi::Abi::RustIntrinsic;
 use syntax::ast;
 use syntax::codemap::Span;
 use rustc_front::intravisit::{self, Visitor, FnKind};
 use rustc_front::hir;
 
-pub fn check_crate(tcx: &ctxt) {
+pub fn check_crate(tcx: &TyCtxt) {
     let mut visitor = IntrinsicCheckingVisitor {
         tcx: tcx,
         param_envs: Vec::new(),
         dummy_sized_ty: tcx.types.isize,
         dummy_unsized_ty: tcx.mk_slice(tcx.types.isize),
     };
-    tcx.map.krate().visit_all_items(&mut visitor);
+    tcx.visit_all_items_in_krate(DepNode::IntrinsicCheck, &mut visitor);
 }
 
 struct IntrinsicCheckingVisitor<'a, 'tcx: 'a> {
-    tcx: &'a ctxt<'tcx>,
+    tcx: &'a TyCtxt<'tcx>,
 
     // As we traverse the AST, we keep a stack of the parameter
     // environments for each function we encounter. When we find a
@@ -234,7 +235,7 @@ impl<'a, 'tcx, 'v> Visitor<'v> for IntrinsicCheckingVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, expr: &hir::Expr) {
         if let hir::ExprPath(..) = expr.node {
             match self.tcx.resolve_expr(expr) {
-                DefFn(did, _) if self.def_id_is_transmute(did) => {
+                Def::Fn(did) if self.def_id_is_transmute(did) => {
                     let typ = self.tcx.node_id_to_type(expr.id);
                     match typ.sty {
                         TyBareFn(_, ref bare_fn_ty) if bare_fn_ty.abi == RustIntrinsic => {

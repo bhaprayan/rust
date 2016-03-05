@@ -46,8 +46,8 @@ pub use tables::UNICODE_VERSION;
 /// This `struct` is created by the [`to_lowercase()`] method on [`char`]. See
 /// its documentation for more.
 ///
-/// [`to_lowercase()`]: primitive.char.html#method.escape_to_lowercase
-/// [`char`]: primitive.char.html
+/// [`to_lowercase()`]: ../primitive.char.html#method.to_lowercase
+/// [`char`]: ../primitive.char.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct ToLowercase(CaseMappingIter);
 
@@ -64,8 +64,8 @@ impl Iterator for ToLowercase {
 /// This `struct` is created by the [`to_uppercase()`] method on [`char`]. See
 /// its documentation for more.
 ///
-/// [`to_uppercase()`]: primitive.char.html#method.escape_to_uppercase
-/// [`char`]: primitive.char.html
+/// [`to_uppercase()`]: ../primitive.char.html#method.to_uppercase
+/// [`char`]: ../primitive.char.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct ToUppercase(CaseMappingIter);
 
@@ -126,7 +126,7 @@ impl char {
     ///
     /// A 'radix' here is sometimes also called a 'base'. A radix of two
     /// indicates a binary number, a radix of ten, decimal, and a radix of
-    /// sixteen, hexicdecimal, to give some common values. Arbitrary
+    /// sixteen, hexadecimal, to give some common values. Arbitrary
     /// radicum are supported.
     ///
     /// Compared to `is_numeric()`, this function only recognizes the characters
@@ -185,7 +185,7 @@ impl char {
     ///
     /// A 'radix' here is sometimes also called a 'base'. A radix of two
     /// indicates a binary number, a radix of ten, decimal, and a radix of
-    /// sixteen, hexicdecimal, to give some common values. Arbitrary
+    /// sixteen, hexadecimal, to give some common values. Arbitrary
     /// radicum are supported.
     ///
     /// 'Digit' is defined to be only the following characters:
@@ -194,7 +194,7 @@ impl char {
     /// * `a-z`
     /// * `A-Z`
     ///
-    /// # Failure
+    /// # Errors
     ///
     /// Returns `None` if the `char` does not refer to a digit in the given radix.
     ///
@@ -386,9 +386,10 @@ impl char {
     /// Returns the number of 16-bit code units this `char` would need if
     /// encoded in UTF-16.
     ///
-    /// See the documentation for [`len_utf8()`][len_utf8] for more explanation
-    /// of this concept. This function is a mirror, but for UTF-16 instead of
-    /// UTF-8.
+    /// See the documentation for [`len_utf8()`] for more explanation of this
+    /// concept. This function is a mirror, but for UTF-16 instead of UTF-8.
+    ///
+    /// [`len_utf8()`]: #method.len_utf8
     ///
     /// # Examples
     ///
@@ -456,16 +457,16 @@ impl char {
     ///
     /// # Examples
     ///
-    /// In both of these examples, 'ß' takes one `u16` to encode.
+    /// In both of these examples, '𝕊' takes two `u16`s to encode.
     ///
     /// ```
     /// #![feature(unicode)]
     ///
-    /// let mut b = [0; 1];
+    /// let mut b = [0; 2];
     ///
-    /// let result = 'ß'.encode_utf16(&mut b);
+    /// let result = '𝕊'.encode_utf16(&mut b);
     ///
-    /// assert_eq!(result, Some(1));
+    /// assert_eq!(result, Some(2));
     /// ```
     ///
     /// A buffer that's too small:
@@ -473,9 +474,9 @@ impl char {
     /// ```
     /// #![feature(unicode)]
     ///
-    /// let mut b = [0; 0];
+    /// let mut b = [0; 1];
     ///
-    /// let result = 'ß'.encode_utf8(&mut b);
+    /// let result = '𝕊'.encode_utf16(&mut b);
     ///
     /// assert_eq!(result, None);
     /// ```
@@ -775,13 +776,13 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// let c = 'c';
+    /// let c = 'C';
     ///
-    /// assert_eq!(c.to_uppercase().next(), Some('C'));
+    /// assert_eq!(c.to_lowercase().next(), Some('c'));
     ///
     /// // Japanese scripts do not have case, and so:
     /// let c = '山';
-    /// assert_eq!(c.to_uppercase().next(), Some('山'));
+    /// assert_eq!(c.to_lowercase().next(), Some('山'));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]

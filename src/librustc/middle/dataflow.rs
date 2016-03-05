@@ -16,8 +16,9 @@
 
 use middle::cfg;
 use middle::cfg::CFGIndex;
-use middle::ty;
+use middle::ty::TyCtxt;
 use std::io;
+use std::mem;
 use std::usize;
 use syntax::ast;
 use syntax::ast_util::IdRange;
@@ -37,7 +38,7 @@ pub enum EntryOrExit {
 
 #[derive(Clone)]
 pub struct DataFlowContext<'a, 'tcx: 'a, O> {
-    tcx: &'a ty::ctxt<'tcx>,
+    tcx: &'a TyCtxt<'tcx>,
 
     /// a name for the analysis using this dataflow instance
     analysis_name: &'static str,
@@ -222,14 +223,15 @@ pub enum KillFrom {
 }
 
 impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
-    pub fn new(tcx: &'a ty::ctxt<'tcx>,
+    pub fn new(tcx: &'a TyCtxt<'tcx>,
                analysis_name: &'static str,
                decl: Option<&hir::FnDecl>,
                cfg: &cfg::CFG,
                oper: O,
                id_range: IdRange,
                bits_per_id: usize) -> DataFlowContext<'a, 'tcx, O> {
-        let words_per_id = (bits_per_id + usize::BITS - 1) / usize::BITS;
+        let usize_bits = mem::size_of::<usize>() * 8;
+        let words_per_id = (bits_per_id + usize_bits - 1) / usize_bits;
         let num_nodes = cfg.graph.all_nodes().len();
 
         debug!("DataFlowContext::new(analysis_name: {}, id_range={:?}, \
@@ -408,10 +410,11 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
         //! Returns false on the first call to `f` that returns false;
         //! if all calls to `f` return true, then returns true.
 
+        let usize_bits = mem::size_of::<usize>() * 8;
         for (word_index, &word) in words.iter().enumerate() {
             if word != 0 {
-                let base_index = word_index * usize::BITS;
-                for offset in 0..usize::BITS {
+                let base_index = word_index * usize_bits;
+                for offset in 0..usize_bits {
                     let bit = 1 << offset;
                     if (word & bit) != 0 {
                         // NB: we round up the total number of bits
@@ -486,7 +489,7 @@ impl<'a, 'tcx, O:DataFlowOperator> DataFlowContext<'a, 'tcx, O> {
                 let bits = &mut self.scope_kills[start.. end];
                 debug!("{} add_kills_from_flow_exits flow_exit={:?} bits={} [before]",
                        self.analysis_name, flow_exit, mut_bits_to_string(bits));
-                bits.clone_from_slice(&orig_kills[..]);
+                bits.copy_from_slice(&orig_kills[..]);
                 debug!("{} add_kills_from_flow_exits flow_exit={:?} bits={} [after]",
                        self.analysis_name, flow_exit, mut_bits_to_string(bits));
             }
@@ -524,8 +527,7 @@ impl<'a, 'tcx, O:DataFlowOperator+Clone+'static> DataFlowContext<'a, 'tcx, O> {
         debug!("{}", {
             let mut v = Vec::new();
             self.pretty_print_to(box &mut v, blk).unwrap();
-            println!("{}", String::from_utf8(v).unwrap());
-            ""
+            String::from_utf8(v).unwrap()
         });
     }
 
@@ -554,7 +556,7 @@ impl<'a, 'b, 'tcx, O:DataFlowOperator> PropagationContext<'a, 'b, 'tcx, O> {
             let (start, end) = self.dfcx.compute_id_range(node_index);
 
             // Initialize local bitvector with state on-entry.
-            in_out.clone_from_slice(&self.dfcx.on_entry[start.. end]);
+            in_out.copy_from_slice(&self.dfcx.on_entry[start.. end]);
 
             // Compute state on-exit by applying transfer function to
             // state on-entry.
@@ -618,7 +620,7 @@ fn bits_to_string(words: &[usize]) -> String {
 
     for &word in words {
         let mut v = word;
-        for _ in 0..usize::BYTES {
+        for _ in 0..mem::size_of::<usize>() {
             result.push(sep);
             result.push_str(&format!("{:02x}", v & 0xFF));
             v >>= 8;
@@ -647,8 +649,9 @@ fn bitwise<Op:BitwiseOperator>(out_vec: &mut [usize],
 fn set_bit(words: &mut [usize], bit: usize) -> bool {
     debug!("set_bit: words={} bit={}",
            mut_bits_to_string(words), bit_str(bit));
-    let word = bit / usize::BITS;
-    let bit_in_word = bit % usize::BITS;
+    let usize_bits = mem::size_of::<usize>() * 8;
+    let word = bit / usize_bits;
+    let bit_in_word = bit % usize_bits;
     let bit_mask = 1 << bit_in_word;
     debug!("word={} bit_in_word={} bit_mask={}", word, bit_in_word, word);
     let oldv = words[word];

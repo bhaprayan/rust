@@ -17,9 +17,12 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 #![crate_name = "rustc_mir"]
 #![crate_type = "rlib"]
 #![crate_type = "dylib"]
+#![cfg_attr(not(stage0), deny(warnings))]
+#![unstable(feature = "rustc_private", issue = "27812")]
 
+#![feature(box_patterns)]
 #![feature(rustc_private)]
-#![feature(into_cow)]
+#![feature(staged_api)]
 
 #[macro_use] extern crate log;
 extern crate graphviz as dot;
@@ -30,8 +33,8 @@ extern crate rustc_back;
 extern crate syntax;
 
 pub mod build;
-pub mod mir_map;
+pub mod graphviz;
 mod hair;
-mod graphviz;
+pub mod mir_map;
+pub mod pretty;
 pub mod transform;
-

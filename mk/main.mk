@@ -13,7 +13,7 @@
 ######################################################################
 
 # The version number
-CFG_RELEASE_NUM=1.6.0
+CFG_RELEASE_NUM=1.9.0
 
 # An optional number to put after the label, e.g. '.2' -> '-beta.2'
 # NB Make sure it starts with a dot to conform to semver pre-release
@@ -22,7 +22,7 @@ CFG_PRERELEASE_VERSION=.1
 
 # Append a version-dependent hash to each library, so we can install different
 # versions in the same place
-CFG_FILENAME_EXTRA=$(shell printf '%s' $(CFG_RELEASE) | $(CFG_HASH_COMMAND))
+CFG_FILENAME_EXTRA=$(shell printf '%s' $(CFG_RELEASE)$(CFG_EXTRA_FILENAME) | $(CFG_HASH_COMMAND))
 
 ifeq ($(CFG_RELEASE_CHANNEL),stable)
 # This is the normal semver version string, e.g. "0.12.0", "0.12.0-nightly"
@@ -131,11 +131,7 @@ endif
 
 ifdef CFG_ENABLE_DEBUGINFO
   $(info cfg: enabling debuginfo (CFG_ENABLE_DEBUGINFO))
-  # FIXME: Re-enable -g in stage0 after new snapshot
-  #CFG_RUSTC_FLAGS += -g
-  RUSTFLAGS_STAGE1 += -g
-  RUSTFLAGS_STAGE2 += -g
-  RUSTFLAGS_STAGE3 += -g
+  CFG_RUSTC_FLAGS += -g
 endif
 
 ifdef SAVE_TEMPS
@@ -153,7 +149,7 @@ endif
 ifdef TRACE
   CFG_RUSTC_FLAGS += -Z trace
 endif
-ifdef CFG_ENABLE_RPATH
+ifndef CFG_DISABLE_RPATH
 CFG_RUSTC_FLAGS += -C rpath
 endif
 
@@ -276,8 +272,17 @@ endif
 # LLVM macros
 ######################################################################
 
-LLVM_COMPONENTS=x86 arm aarch64 mips powerpc ipo bitreader bitwriter linker asmparser mcjit \
+LLVM_OPTIONAL_COMPONENTS=x86 arm aarch64 mips powerpc pnacl
+LLVM_REQUIRED_COMPONENTS=ipo bitreader bitwriter linker asmparser mcjit \
                 interpreter instrumentation
+
+ifneq ($(CFG_LLVM_ROOT),)
+# Ensure we only try to link targets that the installed LLVM actually has:
+LLVM_COMPONENTS := $(filter $(shell $(CFG_LLVM_ROOT)/bin/llvm-config$(X_$(CFG_BUILD)) --components),\
+			$(LLVM_OPTIONAL_COMPONENTS)) $(LLVM_REQUIRED_COMPONENTS)
+else
+LLVM_COMPONENTS := $(LLVM_OPTIONAL_COMPONENTS) $(LLVM_REQUIRED_COMPONENTS)
+endif
 
 # Only build these LLVM tools
 LLVM_TOOLS=bugpoint llc llvm-ar llvm-as llvm-dis llvm-mc opt llvm-extract
@@ -313,6 +318,8 @@ LLVM_HOST_TRIPLE_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --host-target)
 
 LLVM_AS_$(1)=$$(CFG_LLVM_INST_DIR_$(1))/bin/llvm-as$$(X_$(1))
 LLC_$(1)=$$(CFG_LLVM_INST_DIR_$(1))/bin/llc$$(X_$(1))
+
+LLVM_ALL_COMPONENTS_$(1)=$$(shell "$$(LLVM_CONFIG_$(1))" --components)
 
 endef
 
@@ -354,6 +361,9 @@ export CFG_DISABLE_UNSTABLE_FEATURES
 export RUSTC_BOOTSTRAP_KEY:=$(CFG_BOOTSTRAP_KEY)
 endif
 export CFG_BOOTSTRAP_KEY
+ifdef CFG_MUSL_ROOT
+export CFG_MUSL_ROOT
+endif
 
 ######################################################################
 # Per-stage targets and runner
@@ -422,7 +432,7 @@ TSREQ$(1)_T_$(2)_H_$(3) = \
 # target
 SREQ$(1)_T_$(2)_H_$(3) = \
 	$$(TSREQ$(1)_T_$(2)_H_$(3)) \
-	$$(foreach dep,$$(TARGET_CRATES), \
+	$$(foreach dep,$$(TARGET_CRATES_$(2)), \
 	    $$(TLIB$(1)_T_$(2)_H_$(3))/stamp.$$(dep)) \
 	tmp/install-debugger-scripts$(1)_T_$(2)_H_$(3)-$$(call TRIPLE_TO_DEBUGGER_SCRIPT_SETTING,$(2)).done
 
@@ -431,7 +441,7 @@ SREQ$(1)_T_$(2)_H_$(3) = \
 CSREQ$(1)_T_$(2)_H_$(3) = \
 	$$(TSREQ$(1)_T_$(2)_H_$(3)) \
 	$$(HBIN$(1)_H_$(3))/rustdoc$$(X_$(3)) \
-	$$(foreach dep,$$(CRATES),$$(TLIB$(1)_T_$(2)_H_$(3))/stamp.$$(dep))
+	$$(foreach dep,$$(HOST_CRATES),$$(TLIB$(1)_T_$(2)_H_$(3))/stamp.$$(dep))
 
 ifeq ($(1),0)
 # Don't run the stage0 compiler under valgrind - that ship has sailed
@@ -476,7 +486,7 @@ endif
 endif
 
 LD_LIBRARY_PATH_ENV_HOSTDIR$(1)_T_$(2)_H_$(3) := \
-    $$(CURDIR)/$$(HLIB$(1)_H_$(3))
+    $$(CURDIR)/$$(HLIB$(1)_H_$(3)):$$(CFG_LLVM_INST_DIR_$(3))/lib
 LD_LIBRARY_PATH_ENV_TARGETDIR$(1)_T_$(2)_H_$(3) := \
     $$(CURDIR)/$$(TLIB1_T_$(2)_H_$(CFG_BUILD))
 
@@ -510,14 +520,6 @@ STAGE$(1)_T_$(2)_H_$(3) := \
 	$$(Q)$$(RPATH_VAR$(1)_T_$(2)_H_$(3)) \
 		$$(call CFG_RUN_TARG_$(3),$(1), \
 		$$(CFG_VALGRIND_COMPILE$(1)) \
-		$$(HBIN$(1)_H_$(3))/rustc$$(X_$(3)) \
-		--cfg $$(CFGFLAG$(1)_T_$(2)_H_$(3)) \
-		$$(CFG_RUSTC_FLAGS) $$(EXTRAFLAGS_STAGE$(1)) --target=$(2)) \
-                $$(RUSTC_FLAGS_$(2))
-
-PERF_STAGE$(1)_T_$(2)_H_$(3) := \
-	$$(Q)$$(call CFG_RUN_TARG_$(3),$(1), \
-		$$(CFG_PERF_TOOL) \
 		$$(HBIN$(1)_H_$(3))/rustc$$(X_$(3)) \
 		--cfg $$(CFGFLAG$(1)_T_$(2)_H_$(3)) \
 		$$(CFG_RUSTC_FLAGS) $$(EXTRAFLAGS_STAGE$(1)) --target=$(2)) \

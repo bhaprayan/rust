@@ -11,7 +11,6 @@
 use middle::cstore::LOCAL_CRATE;
 use middle::def_id::{DefId, DefIndex};
 use rustc_data_structures::fnv::FnvHashMap;
-use rustc_front::hir;
 use syntax::ast;
 use syntax::parse::token::InternedString;
 use util::nodemap::NodeMap;
@@ -73,7 +72,7 @@ pub enum DefPathData {
     Misc,
 
     // Different kinds of items and item-like things:
-    Impl,
+    Impl(ast::Name),
     Type(ast::Name),
     Mod(ast::Name),
     Value(ast::Name),
@@ -84,8 +83,7 @@ pub enum DefPathData {
     TypeParam(ast::Name),
     LifetimeDef(ast::Name),
     EnumVariant(ast::Name),
-    PositionalField,
-    Field(hir::StructFieldKind),
+    Field(ast::Name),
     StructCtor, // implicit ctor for a tuple-like struct
     Initializer, // initializer for a const
     Binding(ast::Name), // pattern binding
@@ -177,6 +175,7 @@ impl DefPathData {
     pub fn as_interned_str(&self) -> InternedString {
         use self::DefPathData::*;
         match *self {
+            Impl(name) |
             Type(name) |
             Mod(name) |
             Value(name) |
@@ -185,47 +184,35 @@ impl DefPathData {
             LifetimeDef(name) |
             EnumVariant(name) |
             DetachedCrate(name) |
-            Binding(name) => {
+            Binding(name) |
+            Field(name) => {
                 name.as_str()
-            }
-
-            Field(hir::StructFieldKind::NamedField(name, _)) => {
-                name.as_str()
-            }
-
-            PositionalField |
-            Field(hir::StructFieldKind::UnnamedField(_)) => {
-                InternedString::new("<field>")
             }
 
             // note that this does not show up in user printouts
             CrateRoot => {
-                InternedString::new("<root>")
+                InternedString::new("{{root}}")
             }
 
             // note that this does not show up in user printouts
             InlinedRoot(_) => {
-                InternedString::new("<inlined-root>")
+                InternedString::new("{{inlined-root}}")
             }
 
             Misc => {
-                InternedString::new("?")
-            }
-
-            Impl => {
-                InternedString::new("<impl>")
+                InternedString::new("{{?}}")
             }
 
             ClosureExpr => {
-                InternedString::new("<closure>")
+                InternedString::new("{{closure}}")
             }
 
             StructCtor => {
-                InternedString::new("<constructor>")
+                InternedString::new("{{constructor}}")
             }
 
             Initializer => {
-                InternedString::new("<initializer>")
+                InternedString::new("{{initializer}}")
             }
         }
     }

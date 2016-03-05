@@ -83,20 +83,14 @@
 
 // Many of the usings in this module are only used in the test configuration.
 // It's cleaner to just turn off the unused_imports warning than to fix them.
-#![allow(unused_imports)]
+#![cfg_attr(test, allow(unused_imports, dead_code))]
 
 use alloc::boxed::Box;
-use core::clone::Clone;
 use core::cmp::Ordering::{self, Greater, Less};
-use core::cmp::{self, Ord, PartialEq};
-use core::iter::Iterator;
-use core::marker::Sized;
+use core::cmp;
 use core::mem::size_of;
 use core::mem;
-use core::ops::FnMut;
-use core::option::Option::{self, Some, None};
 use core::ptr;
-use core::result::Result;
 use core::slice as core_slice;
 
 use borrow::{Borrow, BorrowMut, ToOwned};
@@ -110,9 +104,9 @@ pub use core::slice::{Iter, IterMut};
 pub use core::slice::{SplitMut, ChunksMut, Split};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::slice::{SplitN, RSplitN, SplitNMut, RSplitNMut};
-#[unstable(feature = "ref_slice", issue = "27774")]
+#[unstable(feature = "slice_bytes", issue = "27740")]
 #[allow(deprecated)]
-pub use core::slice::{bytes, mut_ref_slice, ref_slice};
+pub use core::slice::bytes;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::slice::{from_raw_parts, from_raw_parts_mut};
 
@@ -136,12 +130,7 @@ pub use self::hack::to_vec;
 // `test_permutations` test
 mod hack {
     use alloc::boxed::Box;
-    use core::clone::Clone;
-    #[cfg(test)]
-    use core::iter::Iterator;
     use core::mem;
-    #[cfg(test)]
-    use core::option::Option::{Some, None};
 
     #[cfg(test)]
     use string::ToString;
@@ -418,7 +407,7 @@ impl<T> [T] {
     }
 
     /// Returns an iterator over `size` elements of the slice at a
-    /// time. The chunks do not overlap. If `size` does not divide the
+    /// time. The chunks are slices and do not overlap. If `size` does not divide the
     /// length of the slice, then the last chunk will not have length
     /// `size`.
     ///
@@ -444,7 +433,7 @@ impl<T> [T] {
     }
 
     /// Returns an iterator over `chunk_size` elements of the slice at a time.
-    /// The chunks are mutable and do not overlap. If `chunk_size` does
+    /// The chunks are mutable slices, and do not overlap. If `chunk_size` does
     /// not divide the length of the slice, then the last chunk will not
     /// have length `chunk_size`.
     ///
@@ -788,15 +777,12 @@ impl<T> [T] {
     /// # Examples
     ///
     /// ```rust
-    /// #![feature(slice_sort_by_key)]
-    ///
     /// let mut v = [-5i32, 4, 1, -3, 2];
     ///
     /// v.sort_by_key(|k| k.abs());
     /// assert!(v == [1, 2, -3, 4, -5]);
     /// ```
-    #[unstable(feature = "slice_sort_by_key", reason = "recently added",
-               issue = "27724")]
+    #[stable(feature = "slice_sort_by_key", since = "1.7.0")]
     #[inline]
     pub fn sort_by_key<B, F>(&mut self, mut f: F)
         where F: FnMut(&T) -> B, B: Ord
@@ -829,31 +815,51 @@ impl<T> [T] {
         merge_sort(self, compare)
     }
 
-    /// Copies as many elements from `src` as it can into `self` (the
-    /// shorter of `self.len()` and `src.len()`). Returns the number
-    /// of elements copied.
+    /// Copies the elements from `src` into `self`.
+    ///
+    /// The length of this slice must be the same as the slice passed in.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the two slices have different lengths.
     ///
     /// # Example
     ///
     /// ```rust
-    /// #![feature(clone_from_slice)]
-    ///
     /// let mut dst = [0, 0, 0];
-    /// let src = [1, 2];
+    /// let src = [1, 2, 3];
     ///
-    /// assert!(dst.clone_from_slice(&src) == 2);
-    /// assert!(dst == [1, 2, 0]);
-    ///
-    /// let src2 = [3, 4, 5, 6];
-    /// assert!(dst.clone_from_slice(&src2) == 3);
-    /// assert!(dst == [3, 4, 5]);
+    /// dst.clone_from_slice(&src);
+    /// assert!(dst == [1, 2, 3]);
     /// ```
-    #[unstable(feature = "clone_from_slice", issue = "27750")]
-    pub fn clone_from_slice(&mut self, src: &[T]) -> usize
-        where T: Clone
-    {
+    #[stable(feature = "clone_from_slice", since = "1.7.0")]
+    pub fn clone_from_slice(&mut self, src: &[T]) where T: Clone {
         core_slice::SliceExt::clone_from_slice(self, src)
     }
+
+    /// Copies all elements from `src` into `self`, using a memcpy.
+    ///
+    /// The length of `src` must be the same as `self`.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if the two slices have different lengths.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #![feature(copy_from_slice)]
+    /// let mut dst = [0, 0, 0];
+    /// let src = [1, 2, 3];
+    ///
+    /// dst.copy_from_slice(&src);
+    /// assert_eq!(src, dst);
+    /// ```
+    #[unstable(feature = "copy_from_slice", issue = "31755")]
+    pub fn copy_from_slice(&mut self, src: &[T]) where T: Copy {
+        core_slice::SliceExt::copy_from_slice(self, src)
+    }
+
 
     /// Copies `self` into a new `Vec`.
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -909,15 +915,6 @@ pub trait SliceConcatExt<T: ?Sized> {
     #[stable(feature = "rename_connect_to_join", since = "1.3.0")]
     fn join(&self, sep: &T) -> Self::Output;
 
-    /// Flattens a slice of `T` into a single value `Self::Output`, placing a
-    /// given separator between each.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # #![allow(deprecated)]
-    /// assert_eq!(["hello", "world"].connect(" "), "hello world");
-    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_deprecated(since = "1.3.0", reason = "renamed to join")]
     fn connect(&self, sep: &T) -> Self::Output;

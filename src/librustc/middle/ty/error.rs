@@ -11,12 +11,13 @@
 use middle::def_id::DefId;
 use middle::subst;
 use middle::infer::type_variable;
-use middle::ty::{self, BoundRegion, Region, Ty};
+use middle::ty::{self, BoundRegion, Region, Ty, TyCtxt};
 
 use std::fmt;
 use syntax::abi;
 use syntax::ast::{self, Name};
 use syntax::codemap::Span;
+use syntax::errors::DiagnosticBuilder;
 
 use rustc_front::hir;
 
@@ -210,7 +211,7 @@ impl<'tcx> fmt::Display for TypeError<'tcx> {
 }
 
 impl<'tcx> ty::TyS<'tcx> {
-    fn sort_string(&self, cx: &ty::ctxt) -> String {
+    fn sort_string(&self, cx: &TyCtxt) -> String {
         match self.sty {
             ty::TyBool | ty::TyChar | ty::TyInt(_) |
             ty::TyUint(_) | ty::TyFloat(_) | ty::TyStr => self.to_string(),
@@ -251,28 +252,31 @@ impl<'tcx> ty::TyS<'tcx> {
     }
 }
 
-impl<'tcx> ty::ctxt<'tcx> {
-    pub fn note_and_explain_type_err(&self, err: &TypeError<'tcx>, sp: Span) {
+impl<'tcx> TyCtxt<'tcx> {
+    pub fn note_and_explain_type_err(&self,
+                                     db: &mut DiagnosticBuilder,
+                                     err: &TypeError<'tcx>,
+                                     sp: Span) {
         use self::TypeError::*;
 
         match err.clone() {
             RegionsDoesNotOutlive(subregion, superregion) => {
-                self.note_and_explain_region("", subregion, "...");
-                self.note_and_explain_region("...does not necessarily outlive ",
+                self.note_and_explain_region(db, "", subregion, "...");
+                self.note_and_explain_region(db, "...does not necessarily outlive ",
                                            superregion, "");
             }
             RegionsNotSame(region1, region2) => {
-                self.note_and_explain_region("", region1, "...");
-                self.note_and_explain_region("...is not the same lifetime as ",
+                self.note_and_explain_region(db, "", region1, "...");
+                self.note_and_explain_region(db, "...is not the same lifetime as ",
                                            region2, "");
             }
             RegionsNoOverlap(region1, region2) => {
-                self.note_and_explain_region("", region1, "...");
-                self.note_and_explain_region("...does not overlap ",
+                self.note_and_explain_region(db, "", region1, "...");
+                self.note_and_explain_region(db, "...does not overlap ",
                                            region2, "");
             }
             RegionsInsufficientlyPolymorphic(_, conc_region) => {
-                self.note_and_explain_region("concrete lifetime that was found is ",
+                self.note_and_explain_region(db, "concrete lifetime that was found is ",
                                            conc_region, "");
             }
             RegionsOverlyPolymorphic(_, ty::ReVar(_)) => {
@@ -280,42 +284,40 @@ impl<'tcx> ty::ctxt<'tcx> {
                 // inference variables, it's not very illuminating.
             }
             RegionsOverlyPolymorphic(_, conc_region) => {
-                self.note_and_explain_region("expected concrete lifetime is ",
+                self.note_and_explain_region(db, "expected concrete lifetime is ",
                                            conc_region, "");
             }
             Sorts(values) => {
                 let expected_str = values.expected.sort_string(self);
                 let found_str = values.found.sort_string(self);
                 if expected_str == found_str && expected_str == "closure" {
-                    self.sess.span_note(sp,
+                    db.span_note(sp,
                         "no two closures, even if identical, have the same type");
-                    self.sess.span_help(sp,
+                    db.span_help(sp,
                         "consider boxing your closure and/or using it as a trait object");
                 }
             },
             TyParamDefaultMismatch(values) => {
                 let expected = values.expected;
                 let found = values.found;
-                self.sess.span_note(sp,
-                                    &format!("conflicting type parameter defaults `{}` and `{}`",
-                                             expected.ty,
-                                             found.ty));
+                db.span_note(sp, &format!("conflicting type parameter defaults `{}` and `{}`",
+                                          expected.ty,
+                                          found.ty));
 
                 match
                     self.map.as_local_node_id(expected.def_id)
                             .and_then(|node_id| self.map.opt_span(node_id))
                 {
                     Some(span) => {
-                        self.sess.span_note(span, "a default was defined here...");
+                        db.span_note(span, "a default was defined here...");
                     }
                     None => {
-                        self.sess.note(
-                            &format!("a default is defined on `{}`",
-                                     self.item_path_str(expected.def_id)));
+                        db.note(&format!("a default is defined on `{}`",
+                                         self.item_path_str(expected.def_id)));
                     }
                 }
 
-                self.sess.span_note(
+                db.span_note(
                     expected.origin_span,
                     "...that was applied to an unconstrained type variable here");
 
@@ -324,18 +326,16 @@ impl<'tcx> ty::ctxt<'tcx> {
                             .and_then(|node_id| self.map.opt_span(node_id))
                 {
                     Some(span) => {
-                        self.sess.span_note(span, "a second default was defined here...");
+                        db.span_note(span, "a second default was defined here...");
                     }
                     None => {
-                        self.sess.note(
-                            &format!("a second default is defined on `{}`",
-                                     self.item_path_str(found.def_id)));
+                        db.note(&format!("a second default is defined on `{}`",
+                                         self.item_path_str(found.def_id)));
                     }
                 }
 
-                self.sess.span_note(
-                    found.origin_span,
-                    "...that also applies to the same type variable here");
+                db.span_note(found.origin_span,
+                             "...that also applies to the same type variable here");
             }
             _ => {}
         }

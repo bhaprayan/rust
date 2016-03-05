@@ -12,12 +12,11 @@
 
 use astconv::AstConv;
 use check::FnCtxt;
-use middle::def;
+use middle::def::Def;
 use middle::def_id::DefId;
-use middle::privacy::{AllPublic, DependsOn, LastPrivate, LastMod};
 use middle::subst;
 use middle::traits;
-use middle::ty::{self, RegionEscape, ToPredicate, ToPolyTraitRef, TraitRef};
+use middle::ty::{self, TyCtxt, ToPredicate, ToPolyTraitRef, TraitRef, TypeFoldable};
 use middle::ty::adjustment::{AdjustDerefRef, AutoDerefRef, AutoPtr};
 use middle::infer;
 
@@ -261,7 +260,7 @@ pub fn lookup_in_trait_adjusted<'a, 'tcx>(fcx: &FnCtxt<'a, 'tcx>,
     // FIXME(#18653) -- Try to resolve obligations, giving us more
     // typing information, which can sometimes be needed to avoid
     // pathological region inference failures.
-    fcx.select_new_obligations();
+    fcx.select_obligations_where_possible();
 
     // Insert any adjustments needed (always an autoref of some mutability).
     match self_expr {
@@ -274,13 +273,13 @@ pub fn lookup_in_trait_adjusted<'a, 'tcx>(fcx: &FnCtxt<'a, 'tcx>,
                    method_ty.explicit_self);
 
             match method_ty.explicit_self {
-                ty::ByValueExplicitSelfCategory => {
+                ty::ExplicitSelfCategory::ByValue => {
                     // Trait method is fn(self), no transformation needed.
                     assert!(!unsize);
                     fcx.write_autoderef_adjustment(self_expr.id, autoderefs);
                 }
 
-                ty::ByReferenceExplicitSelfCategory(..) => {
+                ty::ExplicitSelfCategory::ByReference(..) => {
                     // Trait method is fn(&self) or fn(&mut self), need an
                     // autoref. Pull the region etc out of the type of first argument.
                     match transformed_self_ty.sty {
@@ -334,31 +333,24 @@ pub fn resolve_ufcs<'a, 'tcx>(fcx: &FnCtxt<'a, 'tcx>,
                               method_name: ast::Name,
                               self_ty: ty::Ty<'tcx>,
                               expr_id: ast::NodeId)
-                              -> Result<(def::Def, LastPrivate), MethodError<'tcx>>
+                              -> Result<Def, MethodError<'tcx>>
 {
     let mode = probe::Mode::Path;
     let pick = try!(probe::probe(fcx, span, mode, method_name, self_ty, expr_id));
-    let def_id = pick.item.def_id();
-    let mut lp = LastMod(AllPublic);
+    let def = pick.item.def();
+
     if let probe::InherentImplPick = pick.kind {
-        if pick.item.vis() != hir::Public {
-            lp = LastMod(DependsOn(def_id));
+        if pick.item.vis() != hir::Public && !fcx.private_item_is_visible(def.def_id()) {
+            let msg = format!("{} `{}` is private", def.kind_name(), &method_name.as_str());
+            fcx.tcx().sess.span_err(span, &msg);
         }
     }
-    let def_result = match pick.item {
-        ty::ImplOrTraitItem::MethodTraitItem(..) => def::DefMethod(def_id),
-        ty::ImplOrTraitItem::ConstTraitItem(..) => def::DefAssociatedConst(def_id),
-        ty::ImplOrTraitItem::TypeTraitItem(..) => {
-            fcx.tcx().sess.span_bug(span, "resolve_ufcs: probe picked associated type");
-        }
-    };
-    Ok((def_result, lp))
+    Ok(def)
 }
-
 
 /// Find item with name `item_name` defined in `trait_def_id`
 /// and return it, or `None`, if no such item.
-fn trait_item<'tcx>(tcx: &ty::ctxt<'tcx>,
+fn trait_item<'tcx>(tcx: &TyCtxt<'tcx>,
                     trait_def_id: DefId,
                     item_name: ast::Name)
                     -> Option<ty::ImplOrTraitItem<'tcx>>
@@ -369,7 +361,7 @@ fn trait_item<'tcx>(tcx: &ty::ctxt<'tcx>,
                .cloned()
 }
 
-fn impl_item<'tcx>(tcx: &ty::ctxt<'tcx>,
+fn impl_item<'tcx>(tcx: &TyCtxt<'tcx>,
                    impl_def_id: DefId,
                    item_name: ast::Name)
                    -> Option<ty::ImplOrTraitItem<'tcx>>

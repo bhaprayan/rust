@@ -10,7 +10,7 @@
 
 //! HIR walker. Each overridden visit method has full control over what
 //! happens with its node, it can do its own traversal of the node's children,
-//! call `visit::walk_*` to apply the default traversal algorithm, or prevent
+//! call `intravisit::walk_*` to apply the default traversal algorithm, or prevent
 //! deeper traversal by doing nothing.
 //!
 //! When visiting the HIR, the contents of nested items are NOT visited
@@ -26,7 +26,7 @@
 //! property.
 
 use syntax::abi::Abi;
-use syntax::ast::{Ident, NodeId, CRATE_NODE_ID, Name, Attribute};
+use syntax::ast::{NodeId, CRATE_NODE_ID, Name, Attribute};
 use syntax::codemap::Span;
 use hir::*;
 
@@ -45,7 +45,7 @@ pub enum FnKind<'a> {
 /// Each method of the Visitor trait is a hook to be potentially
 /// overridden.  Each method's default implementation recursively visits
 /// the substructure of the input via the corresponding `walk` method;
-/// e.g. the `visit_mod` method by default calls `visit::walk_mod`.
+/// e.g. the `visit_mod` method by default calls `intravisit::walk_mod`.
 ///
 /// Note that this visitor does NOT visit nested items by default
 /// (this is why the module is called `intravisit`, to distinguish it
@@ -468,41 +468,44 @@ pub fn walk_assoc_type_binding<'v, V: Visitor<'v>>(visitor: &mut V,
 
 pub fn walk_pat<'v, V: Visitor<'v>>(visitor: &mut V, pattern: &'v Pat) {
     match pattern.node {
-        PatEnum(ref path, ref opt_children) => {
+        PatKind::TupleStruct(ref path, ref opt_children) => {
             visitor.visit_path(path, pattern.id);
             if let Some(ref children) = *opt_children {
                 walk_list!(visitor, visit_pat, children);
             }
         }
-        PatQPath(ref qself, ref path) => {
+        PatKind::Path(ref path) => {
+            visitor.visit_path(path, pattern.id);
+        }
+        PatKind::QPath(ref qself, ref path) => {
             visitor.visit_ty(&qself.ty);
             visitor.visit_path(path, pattern.id)
         }
-        PatStruct(ref path, ref fields, _) => {
+        PatKind::Struct(ref path, ref fields, _) => {
             visitor.visit_path(path, pattern.id);
             for field in fields {
                 visitor.visit_name(field.span, field.node.name);
                 visitor.visit_pat(&field.node.pat)
             }
         }
-        PatTup(ref tuple_elements) => {
+        PatKind::Tup(ref tuple_elements) => {
             walk_list!(visitor, visit_pat, tuple_elements);
         }
-        PatBox(ref subpattern) |
-        PatRegion(ref subpattern, _) => {
+        PatKind::Box(ref subpattern) |
+        PatKind::Ref(ref subpattern, _) => {
             visitor.visit_pat(subpattern)
         }
-        PatIdent(_, ref pth1, ref optional_subpattern) => {
+        PatKind::Ident(_, ref pth1, ref optional_subpattern) => {
             visitor.visit_ident(pth1.span, pth1.node);
             walk_list!(visitor, visit_pat, optional_subpattern);
         }
-        PatLit(ref expression) => visitor.visit_expr(expression),
-        PatRange(ref lower_bound, ref upper_bound) => {
+        PatKind::Lit(ref expression) => visitor.visit_expr(expression),
+        PatKind::Range(ref lower_bound, ref upper_bound) => {
             visitor.visit_expr(lower_bound);
             visitor.visit_expr(upper_bound)
         }
-        PatWild => (),
-        PatVec(ref prepatterns, ref slice_pattern, ref postpatterns) => {
+        PatKind::Wild => (),
+        PatKind::Vec(ref prepatterns, ref slice_pattern, ref postpatterns) => {
             walk_list!(visitor, visit_pat, prepatterns);
             walk_list!(visitor, visit_pat, slice_pattern);
             walk_list!(visitor, visit_pat, postpatterns);
@@ -666,9 +669,9 @@ pub fn walk_struct_def<'v, V: Visitor<'v>>(visitor: &mut V, struct_definition: &
 }
 
 pub fn walk_struct_field<'v, V: Visitor<'v>>(visitor: &mut V, struct_field: &'v StructField) {
-    walk_opt_name(visitor, struct_field.span, struct_field.node.name());
-    visitor.visit_ty(&struct_field.node.ty);
-    walk_list!(visitor, visit_attribute, &struct_field.node.attrs);
+    visitor.visit_name(struct_field.span, struct_field.name);
+    visitor.visit_ty(&struct_field.ty);
+    walk_list!(visitor, visit_attribute, &struct_field.attrs);
 }
 
 pub fn walk_block<'v, V: Visitor<'v>>(visitor: &mut V, block: &'v Block) {
@@ -732,7 +735,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr) {
             visitor.visit_expr(subexpression)
         }
         ExprLit(_) => {}
-        ExprCast(ref subexpression, ref typ) => {
+        ExprCast(ref subexpression, ref typ) | ExprType(ref subexpression, ref typ) => {
             visitor.visit_expr(subexpression);
             visitor.visit_ty(typ)
         }
@@ -803,8 +806,8 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr) {
             for &(_, ref input) in &ia.inputs {
                 visitor.visit_expr(&input)
             }
-            for &(_, ref output, _) in &ia.outputs {
-                visitor.visit_expr(&output)
+            for output in &ia.outputs {
+                visitor.visit_expr(&output.expr)
             }
         }
     }

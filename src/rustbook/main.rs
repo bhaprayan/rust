@@ -11,7 +11,6 @@
 #![deny(warnings)]
 
 #![feature(iter_arith)]
-#![feature(path_relative_from)]
 #![feature(rustc_private)]
 #![feature(rustdoc)]
 
@@ -37,7 +36,7 @@ mod test;
 
 static EXIT_STATUS: AtomicIsize = ATOMIC_ISIZE_INIT;
 
-fn main() {
+pub fn main() {
     let mut term = Term::new();
     let cmd: Vec<_> = env::args().collect();
 

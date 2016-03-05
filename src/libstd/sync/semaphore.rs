@@ -12,6 +12,7 @@
             reason = "the interaction between semaphores and the acquisition/release \
                       of resources is currently unclear",
             issue = "27798")]
+#![allow(deprecated)]
 
 use ops::Drop;
 use sync::{Mutex, Condvar};
@@ -45,6 +46,13 @@ use sync::{Mutex, Condvar};
 /// // Release our initially acquired resource
 /// sem.release();
 /// ```
+#[rustc_deprecated(since = "1.7.0",
+                   reason = "easily confused with system semaphores and not \
+                             used enough to pull its weight")]
+#[unstable(feature = "semaphore",
+           reason = "the interaction between semaphores and the acquisition/release \
+                     of resources is currently unclear",
+           issue = "27798")]
 pub struct Semaphore {
     lock: Mutex<isize>,
     cvar: Condvar,
@@ -52,10 +60,24 @@ pub struct Semaphore {
 
 /// An RAII guard which will release a resource acquired from a semaphore when
 /// dropped.
+#[rustc_deprecated(since = "1.7.0",
+                   reason = "easily confused with system semaphores and not \
+                             used enough to pull its weight")]
+#[unstable(feature = "semaphore",
+           reason = "the interaction between semaphores and the acquisition/release \
+                     of resources is currently unclear",
+           issue = "27798")]
 pub struct SemaphoreGuard<'a> {
     sem: &'a Semaphore,
 }
 
+#[rustc_deprecated(since = "1.7.0",
+                   reason = "easily confused with system semaphores and not \
+                             used enough to pull its weight")]
+#[unstable(feature = "semaphore",
+           reason = "the interaction between semaphores and the acquisition/release \
+                     of resources is currently unclear",
+           issue = "27798")]
 impl Semaphore {
     /// Creates a new semaphore with the initial count specified.
     ///

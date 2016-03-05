@@ -18,8 +18,7 @@ pub use self::ObligationCauseCode::*;
 use middle::def_id::DefId;
 use middle::free_region::FreeRegionMap;
 use middle::subst;
-use middle::ty::{self, HasTypeFlags, Ty};
-use middle::ty::fold::TypeFoldable;
+use middle::ty::{self, Ty, TypeFoldable};
 use middle::infer::{self, fixup_err_to_string, InferCtxt};
 
 use std::rc::Rc;
@@ -27,14 +26,16 @@ use syntax::ast;
 use syntax::codemap::{Span, DUMMY_SP};
 
 pub use self::error_reporting::TraitErrorKey;
+pub use self::error_reporting::recursive_type_with_infinite_size_error;
 pub use self::error_reporting::report_fulfillment_errors;
 pub use self::error_reporting::report_overflow_error;
+pub use self::error_reporting::report_overflow_error_cycle;
 pub use self::error_reporting::report_selection_error;
 pub use self::error_reporting::report_object_safety_error;
 pub use self::coherence::orphan_check;
 pub use self::coherence::overlapping_impls;
 pub use self::coherence::OrphanCheckErr;
-pub use self::fulfill::{FulfillmentContext, FulfilledPredicates, RegionObligation};
+pub use self::fulfill::{FulfillmentContext, GlobalFulfilledPredicates, RegionObligation};
 pub use self::project::MismatchedProjectionTypes;
 pub use self::project::normalize;
 pub use self::project::Normalized;
@@ -105,9 +106,6 @@ pub struct ObligationCause<'tcx> {
 pub enum ObligationCauseCode<'tcx> {
     /// Not well classified or should be obvious from span.
     MiscObligation,
-
-    /// Obligation that triggers warning until RFC 1214 is fully in place.
-    RFC1214(Rc<ObligationCauseCode<'tcx>>),
 
     /// This is the trait reference from the given projection
     SliceOrArrayElem,
@@ -358,7 +356,7 @@ pub fn type_known_to_meet_builtin_bound<'a,'tcx>(infcx: &InferCtxt<'a,'tcx>,
         // this function's result remains infallible, we must confirm
         // that guess. While imperfect, I believe this is sound.
 
-        let mut fulfill_cx = FulfillmentContext::new(false);
+        let mut fulfill_cx = FulfillmentContext::new();
 
         // We can use a dummy node-id here because we won't pay any mind
         // to region obligations that arise (there shouldn't really be any
@@ -436,8 +434,9 @@ pub fn normalize_param_env_or_error<'a,'tcx>(unnormalized_env: ty::ParameterEnvi
 
     let elaborated_env = unnormalized_env.with_caller_bounds(predicates);
 
-    let infcx = infer::new_infer_ctxt(tcx, &tcx.tables, Some(elaborated_env), false);
-    let predicates = match fully_normalize(&infcx, cause,
+    let infcx = infer::new_infer_ctxt(tcx, &tcx.tables, Some(elaborated_env));
+    let predicates = match fully_normalize(&infcx,
+                                           cause,
                                            &infcx.parameter_environment.caller_bounds) {
         Ok(predicates) => predicates,
         Err(errors) => {
@@ -445,6 +444,9 @@ pub fn normalize_param_env_or_error<'a,'tcx>(unnormalized_env: ty::ParameterEnvi
             return infcx.parameter_environment; // an unnormalized env is better than nothing
         }
     };
+
+    debug!("normalize_param_env_or_error: normalized predicates={:?}",
+           predicates);
 
     let free_regions = FreeRegionMap::new();
     infcx.resolve_regions_and_report_errors(&free_regions, body_id);
@@ -464,6 +466,9 @@ pub fn normalize_param_env_or_error<'a,'tcx>(unnormalized_env: ty::ParameterEnvi
         }
     };
 
+    debug!("normalize_param_env_or_error: resolved predicates={:?}",
+           predicates);
+
     infcx.parameter_environment.with_caller_bounds(predicates)
 }
 
@@ -471,9 +476,9 @@ pub fn fully_normalize<'a,'tcx,T>(infcx: &InferCtxt<'a,'tcx>,
                                   cause: ObligationCause<'tcx>,
                                   value: &T)
                                   -> Result<T, Vec<FulfillmentError<'tcx>>>
-    where T : TypeFoldable<'tcx> + HasTypeFlags
+    where T : TypeFoldable<'tcx>
 {
-    debug!("normalize_param_env(value={:?})", value);
+    debug!("fully_normalize(value={:?})", value);
 
     let mut selcx = &mut SelectionContext::new(infcx);
     // FIXME (@jroesch) ISSUE 26721
@@ -489,20 +494,28 @@ pub fn fully_normalize<'a,'tcx,T>(infcx: &InferCtxt<'a,'tcx>,
     //
     // I think we should probably land this refactor and then come
     // back to this is a follow-up patch.
-    let mut fulfill_cx = FulfillmentContext::new(false);
+    let mut fulfill_cx = FulfillmentContext::new();
 
     let Normalized { value: normalized_value, obligations } =
         project::normalize(selcx, cause, value);
-    debug!("normalize_param_env: normalized_value={:?} obligations={:?}",
+    debug!("fully_normalize: normalized_value={:?} obligations={:?}",
            normalized_value,
            obligations);
     for obligation in obligations {
         fulfill_cx.register_predicate_obligation(selcx.infcx(), obligation);
     }
 
-    try!(fulfill_cx.select_all_or_error(infcx));
+    debug!("fully_normalize: select_all_or_error start");
+    match fulfill_cx.select_all_or_error(infcx) {
+        Ok(()) => { }
+        Err(e) => {
+            debug!("fully_normalize: error={:?}", e);
+            return Err(e);
+        }
+    }
+    debug!("fully_normalize: select_all_or_error complete");
     let resolved_value = infcx.resolve_type_vars_if_possible(&normalized_value);
-    debug!("normalize_param_env: resolved_value={:?}", resolved_value);
+    debug!("fully_normalize: resolved_value={:?}", resolved_value);
     Ok(resolved_value)
 }
 
@@ -551,24 +564,6 @@ impl<'tcx> ObligationCause<'tcx> {
 
     pub fn dummy() -> ObligationCause<'tcx> {
         ObligationCause { span: DUMMY_SP, body_id: 0, code: MiscObligation }
-    }
-}
-
-/// This marker is used in some caches to record whether the
-/// predicate, if it is found to be false, will yield a warning (due
-/// to RFC1214) or an error. We separate these two cases in the cache
-/// so that if we see the same predicate twice, first resulting in a
-/// warning, and next resulting in an error, we still report the
-/// error, rather than considering it a duplicate.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct RFC1214Warning(bool);
-
-impl<'tcx> ObligationCauseCode<'tcx> {
-    pub fn is_rfc1214(&self) -> bool {
-        match *self {
-            ObligationCauseCode::RFC1214(..) => true,
-            _ => false,
-        }
     }
 }
 

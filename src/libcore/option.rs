@@ -154,7 +154,6 @@ use mem;
 use ops::FnOnce;
 use result::Result::{Ok, Err};
 use result::Result;
-use slice;
 
 // Note that this is not a lang item per se, but it has a hidden dependency on
 // `Iterator`, which is one. The compiler assumes that the `next` method of
@@ -170,7 +169,7 @@ pub enum Option<T> {
     None,
     /// Some value `T`
     #[stable(feature = "rust1", since = "1.0.0")]
-    Some(T)
+    Some(#[stable(feature = "rust1", since = "1.0.0")] T)
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -269,47 +268,11 @@ impl<T> Option<T> {
         }
     }
 
-    /// Converts from `Option<T>` to `&mut [T]` (without copying)
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(as_slice)]
-    /// # #![allow(deprecated)]
-    ///
-    /// let mut x = Some("Diamonds");
-    /// {
-    ///     let v = x.as_mut_slice();
-    ///     assert!(v == ["Diamonds"]);
-    ///     v[0] = "Dirt";
-    ///     assert!(v == ["Dirt"]);
-    /// }
-    /// assert_eq!(x, Some("Dirt"));
-    /// ```
-    #[inline]
-    #[unstable(feature = "as_slice",
-               reason = "waiting for mut conventions",
-               issue = "27776")]
-    #[rustc_deprecated(since = "1.4.0", reason = "niche API, unclear of usefulness")]
-    #[allow(deprecated)]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
-        match *self {
-            Some(ref mut x) => {
-                let result: &mut [T] = slice::mut_ref_slice(x);
-                result
-            }
-            None => {
-                let result: &mut [T] = &mut [];
-                result
-            }
-        }
-    }
-
     /////////////////////////////////////////////////////////////////////////
     // Getting to contained values
     /////////////////////////////////////////////////////////////////////////
 
-    /// Unwraps an option, yielding the content of a `Some`
+    /// Unwraps an option, yielding the content of a `Some`.
     ///
     /// # Panics
     ///
@@ -332,7 +295,7 @@ impl<T> Option<T> {
     pub fn expect(self, msg: &str) -> T {
         match self {
             Some(val) => val,
-            None => panic!("{}", msg),
+            None => expect_failed(msg),
         }
     }
 
@@ -690,22 +653,6 @@ impl<T> Option<T> {
     pub fn take(&mut self) -> Option<T> {
         mem::replace(self, None)
     }
-
-    /// Converts from `Option<T>` to `&[T]` (without copying)
-    #[inline]
-    #[unstable(feature = "as_slice", reason = "unsure of the utility here",
-               issue = "27776")]
-    #[rustc_deprecated(since = "1.4.0", reason = "niche API, unclear of usefulness")]
-    #[allow(deprecated)]
-    pub fn as_slice(&self) -> &[T] {
-        match *self {
-            Some(ref x) => slice::ref_slice(x),
-            None => {
-                let result: &[_] = &[];
-                result
-            }
-        }
-    }
 }
 
 impl<'a, T: Clone> Option<&'a T> {
@@ -749,6 +696,14 @@ impl<T: Default> Option<T> {
         }
     }
 }
+
+// This is a separate function to reduce the code size of .expect() itself.
+#[inline(never)]
+#[cold]
+fn expect_failed(msg: &str) -> ! {
+    panic!("{}", msg)
+}
+
 
 /////////////////////////////////////////////////////////////////////////////
 // Trait implementations

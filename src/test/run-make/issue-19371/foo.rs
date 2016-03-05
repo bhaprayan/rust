@@ -55,8 +55,7 @@ fn basic_sess(sysroot: PathBuf) -> (Session, Rc<CStore>) {
 
     let descriptions = Registry::new(&rustc::DIAGNOSTICS);
     let cstore = Rc::new(CStore::new(token::get_ident_interner()));
-    let cstore_ = ::rustc_driver::cstore_to_cratestore(cstore.clone());
-    let sess = build_session(opts, None, descriptions, cstore_);
+    let sess = build_session(opts, None, descriptions, cstore.clone());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     (sess, cstore)
 }
@@ -66,11 +65,11 @@ fn compile(code: String, output: PathBuf, sysroot: PathBuf) {
     let cfg = build_configuration(&sess);
     let control = CompileController::basic();
 
-    compile_input(sess, &cstore,
+    compile_input(&sess, &cstore,
             cfg,
             &Input::Str(code),
             &None,
             &Some(output),
             None,
-            control);
+            &control);
 }

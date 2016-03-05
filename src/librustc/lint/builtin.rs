@@ -117,6 +117,37 @@ declare_lint! {
     Allow,
     "detects trivial casts of numeric types which could be removed"
 }
+
+declare_lint! {
+    pub PRIVATE_IN_PUBLIC,
+    Warn,
+    "detect private items in public interfaces not caught by the old implementation"
+}
+
+declare_lint! {
+    pub INACCESSIBLE_EXTERN_CRATE,
+    Warn,
+    "use of inaccessible extern crate erroneously allowed"
+}
+
+declare_lint! {
+    pub INVALID_TYPE_PARAM_DEFAULT,
+    Warn,
+    "type parameter default erroneously allowed in invalid location"
+}
+
+declare_lint! {
+    pub MATCH_OF_UNIT_VARIANT_VIA_PAREN_DOTDOT,
+    Deny,
+    "unit struct or enum variant erroneously allowed to match via path::ident(..)"
+}
+
+declare_lint! {
+    pub RAW_POINTER_DERIVE,
+    Warn,
+    "uses of #[derive] with raw pointers are rarely correct"
+}
+
 /// Does nothing as a lint pass, but registers some `Lint`s
 /// which are used by other parts of the compiler.
 #[derive(Copy, Clone)]
@@ -141,7 +172,12 @@ impl LintPass for HardwiredLints {
             FAT_PTR_TRANSMUTES,
             TRIVIAL_CASTS,
             TRIVIAL_NUMERIC_CASTS,
-            CONST_ERR
+            PRIVATE_IN_PUBLIC,
+            INACCESSIBLE_EXTERN_CRATE,
+            INVALID_TYPE_PARAM_DEFAULT,
+            MATCH_OF_UNIT_VARIANT_VIA_PAREN_DOTDOT,
+            CONST_ERR,
+            RAW_POINTER_DERIVE
         )
     }
 }

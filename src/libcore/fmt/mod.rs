@@ -25,10 +25,16 @@ use str;
 use self::rt::v1::Alignment;
 
 #[unstable(feature = "fmt_radix", issue = "27728")]
+#[rustc_deprecated(since = "1.7.0", reason = "not used enough to stabilize")]
+#[allow(deprecated)]
 pub use self::num::radix;
 #[unstable(feature = "fmt_radix", issue = "27728")]
+#[rustc_deprecated(since = "1.7.0", reason = "not used enough to stabilize")]
+#[allow(deprecated)]
 pub use self::num::Radix;
 #[unstable(feature = "fmt_radix", issue = "27728")]
+#[rustc_deprecated(since = "1.7.0", reason = "not used enough to stabilize")]
+#[allow(deprecated)]
 pub use self::num::RadixFmt;
 #[stable(feature = "debug_builders", since = "1.2.0")]
 pub use self::builders::{DebugStruct, DebugTuple, DebugSet, DebugList, DebugMap};
@@ -113,6 +119,10 @@ pub trait Write {
         {
             fn write_str(&mut self, s: &str) -> Result {
                 self.0.write_str(s)
+            }
+
+            fn write_char(&mut self, c: char) -> Result {
+                self.0.write_char(c)
             }
 
             fn write_fmt(&mut self, args: Arguments) -> Result {
@@ -356,7 +366,7 @@ impl<'a> Display for Arguments<'a> {
 /// `Debug` implementations using either `derive` or the debug builder API
 /// on `Formatter` support pretty printing using the alternate flag: `{:#?}`.
 ///
-/// [debug_struct]: ../std/fmt/struct.Formatter.html#method.debug_struct
+/// [debug_struct]: ../../std/fmt/struct.Formatter.html#method.debug_struct
 ///
 /// Pretty printing with `#?`:
 ///
@@ -852,7 +862,7 @@ impl<'a> Formatter<'a> {
     ///
     /// # Arguments
     ///
-    /// * is_positive - whether the original integer was positive or not.
+    /// * is_nonnegative - whether the original integer was either positive or zero.
     /// * prefix - if the '#' character (Alternate) is provided, this
     ///   is the prefix to put in front of the number.
     /// * buf - the byte array that the number has been formatted into
@@ -861,7 +871,7 @@ impl<'a> Formatter<'a> {
     /// the minimum width. It will not take precision into account.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn pad_integral(&mut self,
-                        is_positive: bool,
+                        is_nonnegative: bool,
                         prefix: &str,
                         buf: &str)
                         -> Result {
@@ -870,7 +880,7 @@ impl<'a> Formatter<'a> {
         let mut width = buf.len();
 
         let mut sign = None;
-        if !is_positive {
+        if !is_nonnegative {
             sign = Some('-'); width += 1;
         } else if self.sign_plus() {
             sign = Some('+'); width += 1;
@@ -1378,7 +1388,7 @@ impl Display for char {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Pointer for *const T {
+impl<T: ?Sized> Pointer for *const T {
     fn fmt(&self, f: &mut Formatter) -> Result {
         let old_width = f.width;
         let old_flags = f.flags;
@@ -1391,12 +1401,12 @@ impl<T> Pointer for *const T {
             f.flags |= 1 << (FlagV1::SignAwareZeroPad as u32);
 
             if let None = f.width {
-                f.width = Some((::usize::BITS/4) + 2);
+                f.width = Some(((mem::size_of::<usize>() * 8) / 4) + 2);
             }
         }
         f.flags |= 1 << (FlagV1::Alternate as u32);
 
-        let ret = LowerHex::fmt(&(*self as usize), f);
+        let ret = LowerHex::fmt(&(*self as *const () as usize), f);
 
         f.width = old_width;
         f.flags = old_flags;
@@ -1406,28 +1416,22 @@ impl<T> Pointer for *const T {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Pointer for *mut T {
+impl<T: ?Sized> Pointer for *mut T {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        // FIXME(#23542) Replace with type ascription.
-        #![allow(trivial_casts)]
         Pointer::fmt(&(*self as *const T), f)
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, T> Pointer for &'a T {
+impl<'a, T: ?Sized> Pointer for &'a T {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        // FIXME(#23542) Replace with type ascription.
-        #![allow(trivial_casts)]
         Pointer::fmt(&(*self as *const T), f)
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<'a, T> Pointer for &'a mut T {
+impl<'a, T: ?Sized> Pointer for &'a mut T {
     fn fmt(&self, f: &mut Formatter) -> Result {
-        // FIXME(#23542) Replace with type ascription.
-        #![allow(trivial_casts)]
         Pointer::fmt(&(&**self as *const T), f)
     }
 }
@@ -1532,7 +1536,7 @@ macro_rules! tuple {
     ( $($name:ident,)+ ) => (
         #[stable(feature = "rust1", since = "1.0.0")]
         impl<$($name:Debug),*> Debug for ($($name,)*) {
-            #[allow(non_snake_case, unused_assignments)]
+            #[allow(non_snake_case, unused_assignments, deprecated)]
             fn fmt(&self, f: &mut Formatter) -> Result {
                 let mut builder = f.debug_tuple("");
                 let ($(ref $name,)*) = *self;
@@ -1569,7 +1573,7 @@ impl Debug for () {
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Debug for PhantomData<T> {
+impl<T: ?Sized> Debug for PhantomData<T> {
     fn fmt(&self, f: &mut Formatter) -> Result {
         f.pad("PhantomData")
     }

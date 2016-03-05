@@ -15,7 +15,7 @@ pub use self::IdentStyle::*;
 pub use self::Lit::*;
 pub use self::Token::*;
 
-use ast;
+use ast::{self, BinOpKind};
 use ext::mtwt;
 use ptr::P;
 use util::interner::{RcStr, StrInterner};
@@ -223,6 +223,14 @@ impl Token {
         }
     }
 
+    /// Returns `true` if the token is interpolated.
+    pub fn is_interpolated(&self) -> bool {
+        match *self {
+            Interpolated(..) => true,
+            _                => false,
+        }
+    }
+
     /// Returns `true` if the token is an interpolated path.
     pub fn is_path(&self) -> bool {
         match *self {
@@ -256,26 +264,26 @@ impl Token {
     }
 
     /// Maps a token to its corresponding binary operator.
-    pub fn to_binop(&self) -> Option<ast::BinOp_> {
+    pub fn to_binop(&self) -> Option<BinOpKind> {
         match *self {
-            BinOp(Star)     => Some(ast::BiMul),
-            BinOp(Slash)    => Some(ast::BiDiv),
-            BinOp(Percent)  => Some(ast::BiRem),
-            BinOp(Plus)     => Some(ast::BiAdd),
-            BinOp(Minus)    => Some(ast::BiSub),
-            BinOp(Shl)      => Some(ast::BiShl),
-            BinOp(Shr)      => Some(ast::BiShr),
-            BinOp(And)      => Some(ast::BiBitAnd),
-            BinOp(Caret)    => Some(ast::BiBitXor),
-            BinOp(Or)       => Some(ast::BiBitOr),
-            Lt              => Some(ast::BiLt),
-            Le              => Some(ast::BiLe),
-            Ge              => Some(ast::BiGe),
-            Gt              => Some(ast::BiGt),
-            EqEq            => Some(ast::BiEq),
-            Ne              => Some(ast::BiNe),
-            AndAnd          => Some(ast::BiAnd),
-            OrOr            => Some(ast::BiOr),
+            BinOp(Star)     => Some(BinOpKind::Mul),
+            BinOp(Slash)    => Some(BinOpKind::Div),
+            BinOp(Percent)  => Some(BinOpKind::Rem),
+            BinOp(Plus)     => Some(BinOpKind::Add),
+            BinOp(Minus)    => Some(BinOpKind::Sub),
+            BinOp(Shl)      => Some(BinOpKind::Shl),
+            BinOp(Shr)      => Some(BinOpKind::Shr),
+            BinOp(And)      => Some(BinOpKind::BitAnd),
+            BinOp(Caret)    => Some(BinOpKind::BitXor),
+            BinOp(Or)       => Some(BinOpKind::BitOr),
+            Lt              => Some(BinOpKind::Lt),
+            Le              => Some(BinOpKind::Le),
+            Ge              => Some(BinOpKind::Ge),
+            Gt              => Some(BinOpKind::Gt),
+            EqEq            => Some(BinOpKind::Eq),
+            Ne              => Some(BinOpKind::Ne),
+            AndAnd          => Some(BinOpKind::And),
+            OrOr            => Some(BinOpKind::Or),
             _               => None,
         }
     }
@@ -377,7 +385,7 @@ pub enum Nonterminal {
     NtPat(P<ast::Pat>),
     NtExpr(P<ast::Expr>),
     NtTy(P<ast::Ty>),
-    NtIdent(Box<ast::Ident>, IdentStyle),
+    NtIdent(Box<ast::SpannedIdent>, IdentStyle),
     /// Stuff inside brackets for attributes
     NtMeta(P<ast::MetaItem>),
     NtPath(Box<ast::Path>),
@@ -495,9 +503,6 @@ macro_rules! declare_special_idents_and_keywords {(
     }
 
     fn mk_fresh_ident_interner() -> IdentInterner {
-        // The indices here must correspond to the numbers in
-        // special_idents, in Keyword to_name(), and in static
-        // constants below.
         let mut init_vec = Vec::new();
         $(init_vec.push($si_str);)*
         $(init_vec.push($sk_str);)*
@@ -537,7 +542,7 @@ declare_special_idents_and_keywords! {
         // outside of libsyntax
         (7,                          clownshoe_abi,          "__rust_abi");
         (8,                          opaque,                 "<opaque>");
-        (9,                          unnamed_field,          "<unnamed_field>");
+        (9,                          __unused1,              "<__unused1>");
         (super::SELF_TYPE_KEYWORD_NAME_NUM, type_self,       "Self");
         (11,                         prelude_import,         "prelude_import");
     }
@@ -661,7 +666,7 @@ impl InternedString {
 impl Deref for InternedString {
     type Target = str;
 
-    fn deref(&self) -> &str { &*self.string }
+    fn deref(&self) -> &str { &self.string }
 }
 
 impl fmt::Debug for InternedString {
